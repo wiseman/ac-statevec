@@ -18,7 +18,7 @@
         inc (fnil inc 0)]
     (->> rows
          (reduce (fn [state row]
-                   (if (> (:num-rows state) 100000)
+                   (if (> (:num-rows state) 1000000)
                      (reduced state)
                      (let [timestamp (.getTime ^java.sql.Timestamp (:timestamp row))
                            data (:data row)
@@ -60,7 +60,7 @@
     (jdbc/query tx
                 [(jdbc/prepare-statement (:connection tx)
                                          "select * from pings where timestamp > '2018-11-28 00:00:00';"
-                                         {:fetch-size 10})]
+                                         {:fetch-size 1000})]
                 {:result-set-fn (fn [result-set]
                                   (reduce-results result-set))})))
 
