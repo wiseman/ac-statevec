@@ -1,0 +1,5 @@
+{:deps
+ {org.postgresql/postgresql {:mvn/version "42.2.5"}
+  org.clojure/java.jdbc {:mvn/version "0.7.8"}
+  org.opensky-network/libadsb {:mvn/version "3.0.0"}
+  com.lemondronor/ads-b {:mvn/version "0.1.3"}}}
