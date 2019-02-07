@@ -156,14 +156,14 @@
     (let [^TCASResolutionAdvisoryMsg msg msg]
       (update-in state
                  [:tcas]
-                 #(conj % [(:icao row) (.getThreatType msg) (.getThreatIdentity msg)])))
+                 #(conj % [(:timestamp row) (:icao row) (.getThreatType msg) (.getThreatIdentity msg)])))
     state))
 
 
 (defn update-state-timestamps [state row]
   (let [earliest-ts ^java.sql.Timestamp (:earliest-ts state)
         latest-ts ^java.sql.Timestamp (:latest-ts state)
-        ts (:timestamp row)]
+        ts ^java.sql.Timestamp (:timestamp row)]
     (-> state
         (cond-> (or (nil? earliest-ts) (.before ts earliest-ts))
           (assoc :earliest-ts ts))
@@ -177,6 +177,8 @@
         (update-in [:msg-types msg-type] (fnil inc 0))
         (cond-> (= msg-type "MODES_REPLY")
           (update-in [:unknown-df-counts (.getDownlinkFormat msg)] (fnil inc 0)))
+        (cond-> (not (= msg-type "MODES_REPLY"))
+          (update-in [:known-df-counts (.getDownlinkFormat msg)] (fnil inc 0)))
         (cond-> (= msg-type "ADSB_EMERGENCY")
           (update-in [:emergency-types (.getEmergencyStateText ^EmergencyOrPriorityStatusMsg msg)] (fnil inc 0)))
         (cond-> (= msg-type "ADSB_EMERGENCY")
@@ -230,13 +232,12 @@
 
 
 
-(def state_ (atom (initial-state)))
-
 (defn process-all
-  ([]
-   (process-all 1000000))
-  ([count]
+  ([state_]
+   (process-all state_ {:count 1000000}))
+  ([state_ options]
    (let [start-time-ms (System/currentTimeMillis)
+         count (:count options)
          results (jdbc/with-db-transaction [tx db-spec]
                    (jdbc/query tx
                                [(jdbc/prepare-statement
@@ -253,6 +254,14 @@
           (/ duration-ms 1000.0)
           (/ num-rows (/ duration-ms 1000.0)))
      results)))
+
+
+
+(defn hex-to-binary [^String hex]
+  (.toString (BigInteger. hex 16) 2))
+
+(defn binary-to-int [^String bin]
+  (BigInteger. bin 2))
 
 
 (defn -main [& args]
