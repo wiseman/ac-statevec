@@ -1,6 +1,7 @@
 (ns statevec
   ""
-  (:require [clojure.java.jdbc :as jdbc]
+  (:require [cheshire.core :as cheshire]
+            [clojure.java.jdbc :as jdbc]
             [clojure.pprint :as pprint]
             [clojure.string :as string]
             [java-time :as jt])
@@ -20,6 +21,10 @@
 (def db-spec "jdbc:postgresql://wiseman@localhost:5432/orbital")
 
 
+;; ------------------------------------------------------------------------
+;; Utilities.
+;; ------------------------------------------------------------------------
+
 (defn log
   ([msg]
    (println (jt/format DateTimeFormatter/ISO_INSTANT (jt/instant)) msg))
@@ -27,59 +32,13 @@
    (log (apply format fmt args))))
 
 
-;; (defn reduce-results [rows]
-;;   (let [got-first?_ (atom false)
-;;         decoder (ModeSDecoder.)
-;;         decode (fn [^bytes raw timestamp]
-;;                  (.decode decoder raw))
-;;         inc (fnil inc 0)]
-;;     (->> rows
-;;          (reduce (fn [state row]
-;;                    (if (and (> (:num-rows state) 100000))
-;;                      (reduced state)
-;;                      (let [timestamp (.getTime ^java.sql.Timestamp (:timestamp row))
-;;                            ^bytes data (:data row)
-;;                            ^ModeSReply msg (decode data timestamp)]
-;;                        (when (= (:num-rows state) 0)
-;;                          (log "first record"))
-;;                        (-> state
-;;                            (update :num-rows inc)
-;;                            (update-in [:msg-types (.name (.getType msg))] inc)
-;;                            (update-in [:icaos (:icao row)] inc)
-;;                            (cond-> (:is_mlat row)
-;;                              (update :num-mlats inc))
-;;                            (cond-> (and (nil? (:mlat state)) (:is_mlat row))
-;;                              (assoc :mlat [msg
-;;                                            (.getType msg)
-;;                                            (.getDownlinkFormat msg)
-;;                                            (.getFirstField msg)
-;;                                            (seq data)
-;;                                            (org.opensky.libadsb.tools/toHexString data)]))
-;;                            (cond-> (not (.checkParity msg))
-;;                              (update :num-errors inc))
-;;                            (cond-> (instance? org.opensky.libadsb.msgs.AirbornePositionV0Msg msg)
-;;                              (update :num-position-reports inc))))))
-;;                  {:num-rows 0
-;;                   :num-errors 0
-;;                   :num-position-reports 0
-;;                   :num-mlats 0
-;;                   :msg-types {}}))))
-
-
-;; (defn reduce-results2 [rows]
-;;   (reduce (fn [state row]
-;;             (if (> state 1000000)
-;;               (reduced state)
-;;               (inc state)))
-;;           0
-;;           rows))
-
 (defn day-of-week
   ([ts]
    (day-of-week ts (java.util.Calendar/getInstance)))
   ([ts ^java.util.Calendar cal]
    (.setTime cal ts)
    (.get cal java.util.Calendar/DAY_OF_WEEK)))
+
 
 (defn hour-of-day
   ([ts]
@@ -89,79 +48,202 @@
    (.get cal java.util.Calendar/HOUR_OF_DAY)))
 
 
-;; (defn hourly-heatmap-by-icao [rows]
-;;   (let [inc (fnil inc 0)]
-;;     (reduce (fn [state row]
-;;               (if (and (> (:num-rows state) 10))
-;;                 (reduced state)
-;;                 (let [cal (java.util.Calendar/getInstance)
-;;                       dow (day-of-week (:timestamp row) cal)
-;;                       hod (hour-of-day (:timestamp row) cal)]
-;;                   (-> state
-;;                       (update-in [:hour (:icao row) [dow hod]] inc)))))
-;;             {:num-rows 0}
-;;             rows)))
+(defn hex-to-binary [^String hex]
+  (.toString (BigInteger. hex 16) 2))
 
 
-;; (defn hourly-stats [rows]
-;;   (let [inc (fnil inc 0)]
-;;     (reduce (fn [state row]
-;;               (when (= (:num-rows state) 0)
-;;                 (log "got first row"))
-;;               (if (and false (> (:num-rows state) 10000))
-;;                 (reduced state)
-;;                 (let [cal (java.util.Calendar/getInstance)
-;;                       dow (day-of-week (:hour row) cal)
-;;                       hod (hour-of-day (:hour row) cal)]
-;;                   (-> state
-;;                       (update :num-rows inc)
-;;                       (update-in [:hour-stats (:icao row) [dow hod]] inc)))))
-;;             {:num-rows 0}
-;;             rows)))
+(defn binary-to-int [^String bin]
+  (BigInteger. bin 2))
 
 
-;; (defn hourly-stats-for-icao [icao]
-;;   (jdbc/with-db-transaction [tx db-spec]
-;;     (jdbc/query tx
-;;                 [(jdbc/prepare-statement
-;;                   (:connection tx)
-;;                   (str "select icao, date_trunc('hour', timestamp) as hour "
-;;                        "from pings where icao = ? group by icao, hour "
-;;                        "order by hour asc;")
-;;                   {:fetch-size 100000})
-;;                  icao]
-;;                 {:result-set-fn (fn [result-set]
-;;                                   (hourly-stats result-set))})))
+(defn decode-surface-position
+  [^ModeSDecoder decoder
+   ^SurfacePositionV0Msg msg
+   ^java.sql.Timestamp ts
+   ^Position pos]
+  (.decodePosition decoder (.getTime ts) msg pos))
 
 
-;; (defn stats-for-icao [icao]
-;;   (jdbc/with-db-transaction [tx db-spec]
-;;     (jdbc/query tx
-;;                 [(jdbc/prepare-statement
-;;                   (:connection tx)
-;;                   (str "select * from pings where icao = ? order by timestamp asc;")
-;;                   {:fetch-size 100000})
-;;                  icao]
-;;                 {:result-set-fn (fn [result-set]
-;;                                   (reduce-results result-set))})))
+(defn decode-airborne-position
+  [^ModeSDecoder decoder
+   ^AirbornePositionV0Msg msg
+   ^java.sql.Timestamp ts
+   ^Position pos]
+  (.decodePosition decoder (.getTime ts) msg pos))
 
 
-(defn empty-state-vector []
-  {:lat nil
-   :lon nil
-   :alt nil
-   :hdg nil
-   :spd nil
-   :vspd nil
-   :squawk nil
-   :callsign nil})
+(defn update-svv
+  ([sv tag val ts]
+   (update-svv sv tag val ts {}))
+  ([sv tag val ts options]
+   (if (:append? options)
+     (update sv tag (fnil conj []) [val ts])
+     (assoc sv tag [val ts]))))
 
 
-(defn update-dim [sv tag val ts]
-  (assoc sv tag [val ts]))
+(defn get-svv [sv tag]
+  (nth (sv tag) 0))
 
 
-;; (def state_ (atom (statevec/initial-state)))
+(defn state-vecs->json [svs]
+  (map (fn [[icao sv]]
+         (let [pos (get-svv sv :pos)]
+           (-> {:hex icao}
+               (cond->
+                   pos (assoc :lat (:lat pos))
+                   pos (assoc :lon (:lon pos))))))
+       svs))
+
+
+(defn state->json [state]
+  {:now (/ (.getTime ^java.sql.Timestamp (:latest-ts state)) 1000.0)
+   :messages (:num-rows state)
+   :aircraft (state-vecs->json (:state-vecs state))})
+
+
+(defn update-ac-svv
+  ([state rec tag val]
+   (update-ac-svv state rec tag val {}))
+  ([state rec tag val options]
+   (update-in state [:state-vecs (:icao rec)]
+              update-svv tag val (:timestamp rec) options)))
+
+
+;; ------------------------------------------------------------------------
+;; Message handlers.
+;; ------------------------------------------------------------------------
+
+(defmulti update-state-for-msg (fn [state msg rec] (class msg)))
+
+
+(defmacro defmsghandler [type args & body]
+  (let [args [(nth args 0) (with-meta (nth args 1) {:tag type}) (nth args 2)]]
+    `(defmethod update-state-for-msg ~type ~args ~@body)))
+
+
+(defmsghandler org.opensky.libadsb.msgs.AirborneOperationalStatusV1Msg [state msg rec]
+  state)
+
+
+(defmsghandler org.opensky.libadsb.msgs.AirborneOperationalStatusV2Msg [state msg rec]
+  state)
+
+
+(defmsghandler org.opensky.libadsb.msgs.AllCallReply [state msg rec]
+  state)
+
+
+(defmsghandler org.opensky.libadsb.msgs.TCASResolutionAdvisoryMsg [state msg rec]
+  (println msg)
+  (update-ac-svv state rec :tcas (str msg) {:append? true}))
+
+
+(defmsghandler org.opensky.libadsb.msgs.AltitudeReply [state msg rec]
+  (update-ac-svv state rec :alt (.getAltitude msg)))
+
+
+(defmsghandler org.opensky.libadsb.msgs.CommBAltitudeReply [state msg rec]
+  (update-ac-svv state rec :alt (.getAltitude msg)))
+
+
+(defmsghandler org.opensky.libadsb.msgs.CommBIdentifyReply [state msg rec]
+  (update-ac-svv state rec :squawk (.getIdentity msg)))
+
+
+(defmsghandler org.opensky.libadsb.msgs.CommDExtendedLengthMsg [state msg rec]
+  state)
+
+
+;;(defmsghandler org.opensky.libadsb.msgs.ExtendedSquitter [state msg rec]
+;;  state)
+
+
+(defmsghandler org.opensky.libadsb.msgs.IdentifyReply [state msg rec]
+  (update-ac-svv state rec :squawk (.getIdentity msg)))
+
+
+;;(defmsghandler org.opensky.libadsb.msgs.ModeSReply [state msg rec]
+;;  state)
+
+
+(defmsghandler org.opensky.libadsb.msgs.ShortACAS [state msg rec]
+  (update-ac-svv state rec :alt (.getAltitude msg)))
+
+
+(defmsghandler org.opensky.libadsb.msgs.LongACAS [state msg rec]
+  (-> state
+      (update-ac-svv rec :alt (.getAltitude msg))
+      (cond-> (.hasValidRAC msg)
+        (update-ac-svv
+         rec :advisory
+         {:no-pass-below (.noPassBelow msg)
+          :no-pass-above (.noPassAbove msg)
+          :no-turn-left (.noTurnLeft msg)
+          :no-turn-right (.noTurnRight msg)
+          :multiple-threats? (.hasMultipleThreats msg)
+          :terminated? (.hasTerminated msg)}
+         {:append? true}))))
+
+
+(defmsghandler org.opensky.libadsb.msgs.VelocityOverGroundMsg [state msg rec]
+  (-> state
+      (update-ac-svv rec :vspd (.getVerticalRate msg))
+      (update-ac-svv rec :hdg (.getHeading msg))
+      (update-ac-svv rec :spd (.getVelocity msg))))
+
+
+(defmsghandler org.opensky.libadsb.msgs.IdentificationMsg [state msg rec]
+  (update-ac-svv
+   state rec :callsign (String. (.getIdentity msg))))>
+
+
+(defmsghandler org.opensky.libadsb.msgs.AirspeedHeadingMsg [state msg rec]
+  (-> state
+      (cond-> (.hasAirspeedInfo msg)
+        (update-ac-svv rec :air-spd (.getAirspeed msg)))
+      (cond-> (.hasVerticalRateInfo msg)
+        (update-ac-svv rec :vspd (.getVerticalRate msg)))
+      (cond-> (.hasHeadingStatusFlag msg)
+        (update-ac-svv rec :hdg (.getHeading msg)))))
+
+
+(defmsghandler SurfacePositionV0Msg [state msg rec]
+  (let [ts (:timestamp rec)
+        ^Position pos (decode-surface-position
+                       (:decoder state)
+                       msg
+                       ts
+                       (:receiver-pos state))]
+    (if pos
+      (update-ac-svv
+       state rec :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)})
+      state)))
+
+
+(defmsghandler AirbornePositionV0Msg [state msg rec]
+  (let [ts (:timestamp rec)
+        ^Position pos (decode-airborne-position
+                       (:decoder state)
+                       msg
+                       ts
+                       (:receiver-pos state))]
+    (if pos
+      (update-ac-svv
+       state rec :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)})
+      state)))
+
+
+(defmsghandler EmergencyOrPriorityStatusMsg [state msg rec]
+  (-> state
+      (update-in
+       [:emergency-types (.getEmergencyStateText msg)]
+       (fnil inc 0))
+      (update-in
+       [:emergency-icaos (:icao rec)]
+       (fnil inc 0))))
+
+
+;; (def state_ (atom (statevec/initial-state 34.13366 -118.19241)))
 
 (defn initial-state [lat lon]
   {:num-rows 0
@@ -171,19 +253,10 @@
    :num-position-reports 0
    :num-mlats 0
    :msg-types {}
+   :msg-classes {}
    :earliest-ts nil
    :latest-ts nil
-   :state-vecs {}
-   :tcas []})
-
-
-(defn update-state-msg-tcas [state row ^ModeSReply msg]
-  (if (= (.name (.getType msg)) "ADSB_TCAS")
-    (let [^TCASResolutionAdvisoryMsg msg msg]
-      (update-in state
-                 [:tcas]
-                 #(conj % [(:timestamp row) (:icao row) (.getThreatType msg) (.getThreatIdentity msg)])))
-    state))
+   :state-vecs {}})
 
 
 (defn update-state-timestamps [state row]
@@ -201,15 +274,14 @@
   (let [msg-type (.name (.getType msg))]
     (-> state
         (update-in [:msg-types msg-type] (fnil inc 0))
+        (update-in [:msg-classes (class msg)] (fnil inc 0))
+        (cond-> (not (or (= msg-type "MODES_REPLY")
+                         (= msg-type "EXTENDED_SQUITTER")))
+          (update-state-for-msg msg row))
         (cond-> (= msg-type "MODES_REPLY")
           (update-in [:unknown-df-counts (.getDownlinkFormat msg)] (fnil inc 0)))
         (cond-> (not (= msg-type "MODES_REPLY"))
           (update-in [:known-df-counts (.getDownlinkFormat msg)] (fnil inc 0)))
-        (cond-> (= msg-type "ADSB_EMERGENCY")
-          (update-in [:emergency-types (.getEmergencyStateText ^EmergencyOrPriorityStatusMsg msg)] (fnil inc 0)))
-        (cond-> (= msg-type "ADSB_EMERGENCY")
-          (update-in [:emergency-icaos (:icao row)] (fnil inc 0)))
-        (update-state-msg-tcas row msg)
         (cond-> (and (nil? (:mlat state)) (:is_mlat row))
           (assoc :mlat [msg
                         (.getType msg)
@@ -218,9 +290,7 @@
                         (seq (:data row))
                         (org.opensky.libadsb.tools/toHexString ^bytes (:data row))]))
         (cond-> (not (.checkParity msg))
-          (update :num-errors inc))
-        (cond-> (instance? org.opensky.libadsb.msgs.AirbornePositionV0Msg msg)
-          (update :num-position-reports inc)))))
+          (update :num-errors inc)))))
 
 
 (defn update-hour [state row]
@@ -230,29 +300,21 @@
                 true)))
 
 
-(defn decode-surface-position [^ModeSDecoder decoder ^java.sql.Timestamp ts ^SurfacePositionV0Msg msg ^Position pos]
-  (.decodePosition decoder (.getTime ts) msg pos))
-
-
-(defn decode-airborne-position [^ModeSDecoder decoder ^java.sql.Timestamp ts ^AirbornePositionV0Msg msg ^Position pos]
-  (.decodePosition decoder (.getTime ts) msg pos))
-
-
-(defn update-state-msg-position [state row ^ModeSReply msg ^java.sql.Timestamp ts]
-  (cond
-    (instance? SurfacePositionV0Msg msg)
-    (let [^Position pos (decode-surface-position (:decoder state) ts msg (:receiver-pos state))]
-      (if pos
-        (update-in state [:state-vecs (:icao row)]
-                   update-dim :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)} ts))
-      state)
-    (instance? AirbornePositionV0Msg msg)
-    (let [^Position pos (decode-airborne-position (:decoder state) ts msg (:receiver-pos state))]
-      (if pos
-        (update-in state [:state-vecs (:icao row)]
-                   update-dim :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)} ts)
-        state))
-    :else state))
+;; (defn update-state-msg-position [state row ^ModeSReply msg ^java.sql.Timestamp ts]
+;;   (cond
+;;     (instance? SurfacePositionV0Msg msg)
+;;     (let [^Position pos (decode-surface-position (:decoder state) ts msg (:receiver-pos state))]
+;;       (if pos
+;;         (update-in state [:state-vecs (:icao row)]
+;;                    update-dim :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)} ts))
+;;       state)
+;;     (instance? AirbornePositionV0Msg msg)
+;;     (let [^Position pos (decode-airborne-position (:decoder state) ts msg (:receiver-pos state))]
+;;       (if pos
+;;         (update-in state [:state-vecs (:icao row)]
+;;                    update-dim :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)} ts)
+;;         state))
+;;     :else state))
 
 
 (defn reduce-all-results [state_ rows]
@@ -268,9 +330,7 @@
                                    (log "first record"))
                                  (let [s (-> state
                                              (update-state-msg row msg)
-                                             (update-state-msg-position row msg (:timestamp row))
                                              (update-state-timestamps row)
-                                             ;;(update-hour row)
                                              (update :num-rows inc)
                                              (update-in [:icaos (:icao row)] inc)
                                              (cond-> (:is_mlat row)
@@ -305,13 +365,6 @@
           (/ num-rows (/ duration-ms 1000.0)))
      results)))
 
-
-
-(defn hex-to-binary [^String hex]
-  (.toString (BigInteger. hex 16) 2))
-
-(defn binary-to-int [^String bin]
-  (BigInteger. bin 2))
 
 
 (defn -main [& args]
