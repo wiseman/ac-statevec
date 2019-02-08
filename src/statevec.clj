@@ -5,10 +5,14 @@
             [clojure.string :as string]
             [java-time :as jt])
   (:import [java.time.format DateTimeFormatter]
-           [org.opensky.libadsb ModeSDecoder]
+           [org.opensky.libadsb
+            ModeSDecoder
+            Position]
            [org.opensky.libadsb.msgs
-            ModeSReply
+            AirbornePositionV0Msg
             EmergencyOrPriorityStatusMsg
+            ModeSReply
+            SurfacePositionV0Msg
             TCASResolutionAdvisoryMsg]))
 
 (set! *warn-on-reflection* true)
@@ -142,12 +146,34 @@
 ;;                                   (reduce-results result-set))})))
 
 
-(defn initial-state []
+(defn empty-state-vector []
+  {:lat nil
+   :lon nil
+   :alt nil
+   :hdg nil
+   :spd nil
+   :vspd nil
+   :squawk nil
+   :callsign nil})
+
+
+(defn update-dim [sv tag val ts]
+  (assoc sv tag [val ts]))
+
+
+;; (def state_ (atom (statevec/initial-state)))
+
+(defn initial-state [lat lon]
   {:num-rows 0
+   :decoder (ModeSDecoder.)
+   :receiver-pos (Position. lat lon 0.0)
    :num-errors 0
    :num-position-reports 0
    :num-mlats 0
    :msg-types {}
+   :earliest-ts nil
+   :latest-ts nil
+   :state-vecs {}
    :tcas []})
 
 
@@ -204,21 +230,45 @@
                 true)))
 
 
+(defn decode-surface-position [^ModeSDecoder decoder ^java.sql.Timestamp ts ^SurfacePositionV0Msg msg ^Position pos]
+  (.decodePosition decoder (.getTime ts) msg pos))
+
+
+(defn decode-airborne-position [^ModeSDecoder decoder ^java.sql.Timestamp ts ^AirbornePositionV0Msg msg ^Position pos]
+  (.decodePosition decoder (.getTime ts) msg pos))
+
+
+(defn update-state-msg-position [state row ^ModeSReply msg ^java.sql.Timestamp ts]
+  (cond
+    (instance? SurfacePositionV0Msg msg)
+    (let [^Position pos (decode-surface-position (:decoder state) ts msg (:receiver-pos state))]
+      (if pos
+        (update-in state [:state-vecs (:icao row)]
+                   update-dim :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)} ts))
+      state)
+    (instance? AirbornePositionV0Msg msg)
+    (let [^Position pos (decode-airborne-position (:decoder state) ts msg (:receiver-pos state))]
+      (if pos
+        (update-in state [:state-vecs (:icao row)]
+                   update-dim :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)} ts)
+        state))
+    :else state))
+
+
 (defn reduce-all-results [state_ rows]
   (let [got-first?_ (atom false)
-        decoder (ModeSDecoder.)
-        decode (fn [^bytes raw timestamp]
-                 (.decode decoder raw))
+        decoder ^ModeSDecoder (:decoder @state_)
         inc (fnil inc 0)]
     (let [state (->> rows
                      (reduce (fn [state row]
                                (let [timestamp (.getTime ^java.sql.Timestamp (:timestamp row))
                                      ^bytes data (:data row)
-                                     ^ModeSReply msg (decode data timestamp)]
+                                     ^ModeSReply msg (.decode decoder data)]
                                  (when (= (:num-rows state) 0)
                                    (log "first record"))
                                  (let [s (-> state
                                              (update-state-msg row msg)
+                                             (update-state-msg-position row msg (:timestamp row))
                                              (update-state-timestamps row)
                                              ;;(update-hour row)
                                              (update :num-rows inc)
