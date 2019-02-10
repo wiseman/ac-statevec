@@ -4,7 +4,10 @@
             [clojure.java.jdbc :as jdbc]
             [clojure.pprint :as pprint]
             [clojure.string :as string]
-            [java-time :as jt])
+            [compojure.route :as route]
+            [compojure.core :as compojure]
+            [java-time :as jt]
+            [org.httpkit.server :as server])
   (:import [java.time.format DateTimeFormatter]
            [org.opensky.libadsb
             ModeSDecoder
@@ -85,20 +88,36 @@
   (nth (sv tag) 0))
 
 
-(defn state-vecs->json [svs]
+(defn get-svv-time [sv tag]
+  (nth (sv tag) 1))
+
+
+(defn state-vecs->json [svs now-secs]
   (map (fn [[icao sv]]
          (let [pos (get-svv sv :pos)]
-           (-> {:hex icao}
+           (-> {:hex icao
+                :messages 100
+                :seen 0.1}
                (cond->
                    pos (assoc :lat (:lat pos))
-                   pos (assoc :lon (:lon pos))))))
+                   pos (assoc :lon (:lon pos))
+                   pos (assoc
+                        :seen_pos
+                        (- now-secs
+                           (/ (.getTime ^java.sql.Timestamp (get-svv-time sv :pos))
+                              1000.0)))
+                   (:squawk sv) (assoc :squawk (get-svv sv :squawk))
+                   (:callsign sv) (assoc :flight (get-svv sv :callsign))
+                   (:hdg sv) (assoc :track (get-svv sv :hdg))
+                   (:alt sv) (assoc :altitude (get-svv sv :alt))))))
        svs))
 
 
 (defn state->json [state]
-  {:now (/ (.getTime ^java.sql.Timestamp (:latest-ts state)) 1000.0)
-   :messages (:num-rows state)
-   :aircraft (state-vecs->json (:state-vecs state))})
+  (let [now-secs (/ (.getTime ^java.sql.Timestamp (:latest-ts state)) 1000.0)]
+    {:now now-secs
+     :messages (:num-rows state)
+     :aircraft (state-vecs->json (:state-vecs state) now-secs)}))
 
 
 (defn update-ac-svv
@@ -244,6 +263,8 @@
 
 
 ;; (def state_ (atom (statevec/initial-state 34.13366 -118.19241)))
+;; (statevec/start-server state_)
+;; (statevec/process-all state_ {:count 10000000 :fetch-size 100})
 
 (defn initial-state [lat lon]
   {:num-rows 0
@@ -353,7 +374,7 @@
                                [(jdbc/prepare-statement
                                  (:connection tx)
                                  (str "select * from pings order by timestamp asc limit " count ";")
-                                 {:fetch-size 100000})]
+                                 {:fetch-size (or (:fetch-size options) 100000)})]
                                {:result-set-fn (fn [result-set]
                                                  (reduce-all-results state_ result-set))}))
          end-time-ms (System/currentTimeMillis)
@@ -365,6 +386,27 @@
           (/ num-rows (/ duration-ms 1000.0)))
      results)))
 
+
+(defn serve-aircraft-json [state_]
+  (-> @state_
+      state->json
+      cheshire/generate-string))
+
+(defonce server_ (atom nil))
+
+
+(defn start-server [state_]
+  (when @server_
+    (@server_))
+  (let [app (compojure/routes
+             (compojure/GET "/data/aircraft.json" [] (fn [req] (serve-aircraft-json state_)))
+             (route/files "/"))]
+    (reset! server_ (server/run-server app {:port 8080}))))
+
+
+(defn stop-server []
+  (when @server_
+    (@server_)))
 
 
 (defn -main [& args]
