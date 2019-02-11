@@ -21,6 +21,12 @@
 
 (set! *warn-on-reflection* true)
 
+
+;; (def state_ (atom (statevec/initial-state 34.13366 -118.19241)))
+;; (statevec/start-server state_)
+;; (statevec/process-all state_ {:count 10000000 :fetch-size 1000})
+
+
 (def db-spec "jdbc:postgresql://wiseman@localhost:5432/orbital")
 
 
@@ -75,6 +81,8 @@
   (.decodePosition decoder (.getTime ts) msg pos))
 
 
+(def safe-inc (fnil inc 0))
+
 (defn update-svv
   ([sv tag val ts]
    (update-svv sv tag val ts {}))
@@ -84,20 +92,45 @@
      (assoc sv tag [val ts]))))
 
 
-(defn get-svv [sv tag]
-  (nth (sv tag) 0))
+(defn get-svv
+  ([sv tag]
+   (get-svv sv tag nil))
+  ([sv tag default]
+   (if sv
+     (let [pair (sv tag)]
+       (if pair
+         (nth (sv tag) 0)
+         default))
+     default)))
 
 
 (defn get-svv-time [sv tag]
   (nth (sv tag) 1))
 
 
+(defn state->receiver-json [state_]
+  (let [^Position pos (:receiver-pos state_)]
+    {:lat (.getLatitude pos)
+     :lon (.getLongitude pos)
+     :refresh 33
+     :version "1.0"
+     :history 0}))
+
+
+(defn state-vec-last-updated [sv]
+  (get-svv-time sv :msg-count))
+
+
 (defn state-vecs->json [svs now-secs]
   (map (fn [[icao sv]]
-         (let [pos (get-svv sv :pos)]
+         (let [pos (get-svv sv :pos)
+               ^java.sql.Timestamp last-update (state-vec-last-updated sv)
+               last-update-secs (if last-update
+                                  (- now-secs (/ (.getTime last-update) 1000.0))
+                                  100000)]
            (-> {:hex icao
-                :messages 100
-                :seen 0.1}
+                :messages (get-svv sv :msg-count)
+                :seen last-update-secs}
                (cond->
                    pos (assoc :lat (:lat pos))
                    pos (assoc :lon (:lon pos))
@@ -109,12 +142,17 @@
                    (:squawk sv) (assoc :squawk (get-svv sv :squawk))
                    (:callsign sv) (assoc :flight (get-svv sv :callsign))
                    (:hdg sv) (assoc :track (get-svv sv :hdg))
+                   (:vspd sv) (assoc :vert_rate (get-svv sv :vspd))
+                   (:spd sv) (assoc :speed (get-svv sv :spd))
                    (:alt sv) (assoc :altitude (get-svv sv :alt))))))
        svs))
 
 
-(defn state->json [state]
-  (let [now-secs (/ (.getTime ^java.sql.Timestamp (:latest-ts state)) 1000.0)]
+(defn state->aircraft-json [state]
+  (let [^java.sql.Timestamp latest-ts (:latest-ts state)
+        now-secs (if latest-ts
+                   (/ (.getTime latest-ts) 1000.0)
+                   nil)]
     {:now now-secs
      :messages (:num-rows state)
      :aircraft (state-vecs->json (:state-vecs state) now-secs)}))
@@ -124,6 +162,7 @@
   ([state rec tag val]
    (update-ac-svv state rec tag val {}))
   ([state rec tag val options]
+   (assert (:icao rec))
    (update-in state [:state-vecs (:icao rec)]
               update-svv tag val (:timestamp rec) options)))
 
@@ -256,20 +295,16 @@
   (-> state
       (update-in
        [:emergency-types (.getEmergencyStateText msg)]
-       (fnil inc 0))
+       safe-inc)
       (update-in
        [:emergency-icaos (:icao rec)]
-       (fnil inc 0))))
+       safe-inc)))
 
-
-;; (def state_ (atom (statevec/initial-state 34.13366 -118.19241)))
-;; (statevec/start-server state_)
-;; (statevec/process-all state_ {:count 10000000 :fetch-size 100})
 
 (defn initial-state [lat lon]
   {:num-rows 0
    :decoder (ModeSDecoder.)
-   :receiver-pos (Position. lat lon 0.0)
+   :receiver-pos (Position. lon lat 0.0)
    :num-errors 0
    :num-position-reports 0
    :num-mlats 0
@@ -294,15 +329,19 @@
 (defn update-state-msg [state row ^ModeSReply msg]
   (let [msg-type (.name (.getType msg))]
     (-> state
-        (update-in [:msg-types msg-type] (fnil inc 0))
-        (update-in [:msg-classes (class msg)] (fnil inc 0))
+        (update-in [:msg-types msg-type] safe-inc)
+        (update-in [:msg-classes (class msg)] safe-inc)
+        (update-ac-svv
+         row
+         :msg-count
+         (safe-inc (get-svv (get-in state [:state-vecs (:icao row)]) :msg-count 0)))
         (cond-> (not (or (= msg-type "MODES_REPLY")
                          (= msg-type "EXTENDED_SQUITTER")))
           (update-state-for-msg msg row))
         (cond-> (= msg-type "MODES_REPLY")
-          (update-in [:unknown-df-counts (.getDownlinkFormat msg)] (fnil inc 0)))
+          (update-in [:unknown-df-counts (.getDownlinkFormat msg)] safe-inc))
         (cond-> (not (= msg-type "MODES_REPLY"))
-          (update-in [:known-df-counts (.getDownlinkFormat msg)] (fnil inc 0)))
+          (update-in [:known-df-counts (.getDownlinkFormat msg)] safe-inc))
         (cond-> (and (nil? (:mlat state)) (:is_mlat row))
           (assoc :mlat [msg
                         (.getType msg)
@@ -340,8 +379,7 @@
 
 (defn reduce-all-results [state_ rows]
   (let [got-first?_ (atom false)
-        decoder ^ModeSDecoder (:decoder @state_)
-        inc (fnil inc 0)]
+        decoder ^ModeSDecoder (:decoder @state_)]
     (let [state (->> rows
                      (reduce (fn [state row]
                                (let [timestamp (.getTime ^java.sql.Timestamp (:timestamp row))
@@ -352,10 +390,10 @@
                                  (let [s (-> state
                                              (update-state-msg row msg)
                                              (update-state-timestamps row)
-                                             (update :num-rows inc)
-                                             (update-in [:icaos (:icao row)] inc)
+                                             (update :num-rows safe-inc)
+                                             (update-in [:icaos (:icao row)] safe-inc)
                                              (cond-> (:is_mlat row)
-                                               (update :num-mlats inc)))]
+                                               (update :num-mlats safe-inc)))]
                                    (reset! state_ s)
                                    s)))
                              @state_))]
@@ -387,10 +425,20 @@
      results)))
 
 
+(defn serve-receiver-json [state_]
+  {:status 200
+   :headers {"Content-Type" "application/json; charset=utf-8"}
+   :body (-> @state_
+             state->receiver-json
+             cheshire/generate-string)})
+
+
 (defn serve-aircraft-json [state_]
-  (-> @state_
-      state->json
-      cheshire/generate-string))
+  {:status 200
+   :headers {"Content-Type" "application/json; charset=utf-8"}
+   :body (-> @state_
+             state->aircraft-json
+             cheshire/generate-string)})
 
 (defonce server_ (atom nil))
 
@@ -399,6 +447,7 @@
   (when @server_
     (@server_))
   (let [app (compojure/routes
+             (compojure/GET "/data/receiver.json" [] (fn [req] (serve-receiver-json state_)))
              (compojure/GET "/data/aircraft.json" [] (fn [req] (serve-aircraft-json state_)))
              (route/files "/"))]
     (reset! server_ (server/run-server app {:port 8080}))))
