@@ -41,6 +41,10 @@
    (log (apply format fmt args))))
 
 
+(defn dbfs [v]
+  (* 20 (Math/log10 (/ (max v 0.5) 255.0))))
+
+
 (defn day-of-week
   ([ts]
    (day-of-week ts (java.util.Calendar/getInstance)))
@@ -192,7 +196,6 @@
 
 
 (defmsghandler org.opensky.libadsb.msgs.TCASResolutionAdvisoryMsg [state msg rec]
-  (println msg)
   (update-ac-svv state rec :tcas (str msg) {:append? true}))
 
 
@@ -335,6 +338,7 @@
          row
          :msg-count
          (safe-inc (get-svv (get-in state [:state-vecs (:icao row)]) :msg-count 0)))
+        (update-ac-svv row :rssi (dbfs (:signal_level row)))
         (cond-> (not (or (= msg-type "MODES_REPLY")
                          (= msg-type "EXTENDED_SQUITTER")))
           (update-state-for-msg msg row))

@@ -21,7 +21,7 @@ var SpecialSquawks = {
 var CenterLat, CenterLon, ZoomLvl, MapType;
 
 var Dump1090Version = "unknown version";
-var RefreshInterval = 100;
+var RefreshInterval = 1000;
 
 var PlaneRowTemplate = null;
 
