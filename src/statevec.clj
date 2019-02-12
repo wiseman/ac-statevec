@@ -364,45 +364,66 @@
                 true)))
 
 
-;; (defn update-state-msg-position [state row ^ModeSReply msg ^java.sql.Timestamp ts]
-;;   (cond
-;;     (instance? SurfacePositionV0Msg msg)
-;;     (let [^Position pos (decode-surface-position (:decoder state) ts msg (:receiver-pos state))]
-;;       (if pos
-;;         (update-in state [:state-vecs (:icao row)]
-;;                    update-dim :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)} ts))
-;;       state)
-;;     (instance? AirbornePositionV0Msg msg)
-;;     (let [^Position pos (decode-airborne-position (:decoder state) ts msg (:receiver-pos state))]
-;;       (if pos
-;;         (update-in state [:state-vecs (:icao row)]
-;;                    update-dim :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)} ts)
-;;         state))
-;;     :else state))
+(def record-flights-interval 10000)
+(def flight-timeout (* 10 60 1000))
+
+
+(defn record-flights [state]
+  (let [^java.sql.Timestamp latest-ts (:latest-ts state)
+        ^java.sql.Timestamp record-flights-check-ts (::record-flights-check-ts state)]
+    (cond
+      ;; Haven't checked for flights yet;
+      (nil? record-flights-check-ts)
+      (assoc state ::record-flights-check-ts latest-ts)
+      ;; Have checked for flights recently:
+      (< (- (.getTime latest-ts) (.getTime record-flights-check-ts)) record-flights-interval)
+      state
+      ;; Time to check for flights:
+      :else
+      (do (log "recording flights")
+          (-> state
+              (assoc ::record-flights-check-ts latest-ts)
+              (update
+               :state-vecs
+               (fn update-svs [svs]
+                 (into
+                  {}
+                  (filter (fn woo [[icao sv]]
+                            (let [^java.sql.Timestamp last-updated (state-vec-last-updated sv)]
+                              (if (>= (- (.getTime latest-ts) (.getTime last-updated)) flight-timeout)
+                                (do (log "Saving off flight for %s (%s messages) at %s"
+                                         icao
+                                         (get-svv sv :msg-count)
+                                         latest-ts)
+                                    false)
+                                true)))
+                          svs)))))))))
+
+
+(defn update-state [^ModeSDecoder decoder state row]
+  (let [timestamp (.getTime ^java.sql.Timestamp (:timestamp row))
+        ^bytes data (:data row)
+        ^ModeSReply msg (.decode decoder data)]
+    (when (= (:num-rows state) 0)
+      (log "Got first record"))
+    (-> state
+        (update-state-msg row msg)
+        (update-state-timestamps row)
+        (update :num-rows safe-inc)
+        (update-in [:icaos (:icao row)] safe-inc)
+        (cond-> (:is_mlat row)
+          (update :num-mlats safe-inc))
+        record-flights)))
 
 
 (defn reduce-all-results [state_ rows]
   (let [got-first?_ (atom false)
         decoder ^ModeSDecoder (:decoder @state_)]
-    (let [state (->> rows
-                     (reduce (fn [state row]
-                               (let [timestamp (.getTime ^java.sql.Timestamp (:timestamp row))
-                                     ^bytes data (:data row)
-                                     ^ModeSReply msg (.decode decoder data)]
-                                 (when (= (:num-rows state) 0)
-                                   (log "first record"))
-                                 (let [s (-> state
-                                             (update-state-msg row msg)
-                                             (update-state-timestamps row)
-                                             (update :num-rows safe-inc)
-                                             (update-in [:icaos (:icao row)] safe-inc)
-                                             (cond-> (:is_mlat row)
-                                               (update :num-mlats safe-inc)))]
-                                   (reset! state_ s)
-                                   s)))
-                             @state_))]
-      (reset! state_ (assoc state :complete? true)))))
-
+    (let [state (reduce (fn [state row]
+                          (reset! state_ (update-state decoder state row)))
+                        @state_
+                        rows)]
+      (reset! state_ (assoc state :processing-complete? true)))))
 
 
 (defn process-all
