@@ -3,11 +3,13 @@
   (:require [cheshire.core :as cheshire]
             [clojure.java.jdbc :as jdbc]
             [clojure.pprint :as pprint]
+            [clojure.set :as set]
             [clojure.string :as string]
             [compojure.route :as route]
             [compojure.core :as compojure]
             [java-time :as jt]
-            [org.httpkit.server :as server])
+            [org.httpkit.server :as server]
+            [clojure.set :as set])
   (:import [java.time.format DateTimeFormatter]
            [org.opensky.libadsb
             ModeSDecoder
@@ -123,43 +125,6 @@
 
 (defn state-vec-last-updated [sv]
   (get-svv-time sv :msg-count))
-
-
-(defn state-vecs->json [svs now-secs]
-  (map (fn [[icao sv]]
-         (let [pos (get-svv sv :pos)
-               ^java.sql.Timestamp last-update (state-vec-last-updated sv)
-               last-update-secs (if last-update
-                                  (- now-secs (/ (.getTime last-update) 1000.0))
-                                  100000)]
-           (-> {:hex icao
-                :messages (get-svv sv :msg-count)
-                :seen last-update-secs}
-               (cond->
-                   pos (assoc :lat (:lat pos))
-                   pos (assoc :lon (:lon pos))
-                   pos (assoc
-                        :seen_pos
-                        (- now-secs
-                           (/ (.getTime ^java.sql.Timestamp (get-svv-time sv :pos))
-                              1000.0)))
-                   (:squawk sv) (assoc :squawk (get-svv sv :squawk))
-                   (:callsign sv) (assoc :flight (get-svv sv :callsign))
-                   (:hdg sv) (assoc :track (get-svv sv :hdg))
-                   (:vspd sv) (assoc :vert_rate (get-svv sv :vspd))
-                   (:spd sv) (assoc :speed (get-svv sv :spd))
-                   (:alt sv) (assoc :altitude (get-svv sv :alt))))))
-       svs))
-
-
-(defn state->aircraft-json [state]
-  (let [^java.sql.Timestamp latest-ts (:latest-ts state)
-        now-secs (if latest-ts
-                   (/ (.getTime latest-ts) 1000.0)
-                   nil)]
-    {:now now-secs
-     :messages (:num-rows state)
-     :aircraft (state-vecs->json (:state-vecs state) now-secs)}))
 
 
 (defn update-ac-svv
@@ -380,7 +345,7 @@
       state
       ;; Time to check for flights:
       :else
-      (do (log "recording flights")
+      (do ;;(log "recording flights")
           (-> state
               (assoc ::record-flights-check-ts latest-ts)
               (update
@@ -391,11 +356,9 @@
                   (filter (fn woo [[icao sv]]
                             (let [^java.sql.Timestamp last-updated (state-vec-last-updated sv)]
                               (if (>= (- (.getTime latest-ts) (.getTime last-updated)) flight-timeout)
-                                (do (log "Saving off flight for %s (%s messages) at %s"
-                                         icao
-                                         (get-svv sv :msg-count)
-                                         latest-ts)
-                                    false)
+                                (do
+                                  ;;(log "Saving off flight for %s (%s messages) at %s" icao (get-svv sv :msg-count) latest-ts)
+                                  false)
                                 true)))
                           svs)))))))))
 
@@ -450,6 +413,64 @@
      results)))
 
 
+(defmulti state-vec->json (fn [kind sv icao now-secs] kind))
+
+
+(defmethod state-vec->json :dump1090-mutability [kind sv icao now-secs]
+  (let [pos (get-svv sv :pos)
+        ^java.sql.Timestamp last-update (state-vec-last-updated sv)
+        last-update-secs (if last-update
+                           (- now-secs (/ (.getTime last-update) 1000.0))
+                           100000)]
+    (-> {:hex icao
+         :messages (get-svv sv :msg-count)
+         :seen last-update-secs
+         :rssi (get-svv sv :rssi)}
+        (cond->
+            pos (assoc :lat (:lat pos))
+            pos (assoc :lon (:lon pos))
+            pos (assoc
+                 :seen_pos
+                 (- now-secs
+                    (/ (.getTime ^java.sql.Timestamp (get-svv-time sv :pos))
+                       1000.0)))
+            (:squawk sv) (assoc :squawk (get-svv sv :squawk))
+            (:callsign sv) (assoc :flight (get-svv sv :callsign))
+            (:hdg sv) (assoc :track (get-svv sv :hdg))
+            (:vspd sv) (assoc :vert_rate (get-svv sv :vspd))
+            (:spd sv) (assoc :speed (get-svv sv :spd))
+            (:alt sv) (assoc :altitude (get-svv sv :alt))))))
+
+
+;; FlightAware's dump1090 uses almost the same JSON. The main
+;; differences seem to be (1) some keys have different names and (2)
+;; mlat- and tis-b- sourced info is called out.
+
+(defmethod state-vec->json :dump1090-fa [kind sv icao now-secs]
+  (let [json (state-vec->json :dump1090-mutability sv icao now-secs)]
+    (set/rename-keys
+     json
+     {:altitude :alt_baro
+      :speed :gs
+      :vert_rate :baro_rate})))
+
+
+(defn state-vecs->json [kind svs now-secs]
+  (map (fn [[icao sv]]
+         (state-vec->json kind sv icao now-secs))
+       svs))
+
+
+(defn state->aircraft-json [kind state]
+  (let [^java.sql.Timestamp latest-ts (:latest-ts state)
+        now-secs (if latest-ts
+                   (/ (.getTime latest-ts) 1000.0)
+                   nil)]
+    {:now now-secs
+     :messages (:num-rows state)
+     :aircraft (state-vecs->json kind (:state-vecs state) now-secs)}))
+
+
 (defn serve-receiver-json [state_]
   {:status 200
    :headers {"Content-Type" "application/json; charset=utf-8"}
@@ -458,12 +479,13 @@
              cheshire/generate-string)})
 
 
-(defn serve-aircraft-json [state_]
-  {:status 200
-   :headers {"Content-Type" "application/json; charset=utf-8"}
-   :body (-> @state_
-             state->aircraft-json
-             cheshire/generate-string)})
+(defn serve-aircraft-json [kind state_]
+  (let [json-gen (partial state->aircraft-json kind)]
+    {:status 200
+     :headers {"Content-Type" "application/json; charset=utf-8"}
+     :body (-> @state_
+               json-gen
+               cheshire/generate-string)}))
 
 (defonce server_ (atom nil))
 
@@ -472,9 +494,13 @@
   (when @server_
     (@server_))
   (let [app (compojure/routes
-             (compojure/GET "/data/receiver.json" [] (fn [req] (serve-receiver-json state_)))
-             (compojure/GET "/data/aircraft.json" [] (fn [req] (serve-aircraft-json state_)))
-             (route/files "/"))]
+             (compojure/GET "/*/data/receiver.json" [] (fn [req] (serve-receiver-json state_)))
+             (compojure/GET "/1/data/aircraft.json" []
+                            (fn [req] (serve-aircraft-json :dump1090-mutability state_)))
+             (compojure/GET "/2/data/aircraft.json" []
+                            (fn [req] (serve-aircraft-json :dump1090-fa state_)))
+             (route/files "/1/" {:root "public/html-dump1090-mutability"})
+             (route/files "/2/" {:root "public/html-dump1090-fa"}))]
     (reset! server_ (server/run-server app {:port 8080}))))
 
 
@@ -484,12 +510,6 @@
 
 
 (defn -main [& args]
-  (log "%s" args)
-  (let [stats (process-all)]
-    ;;(pprint/pprint stats)
-    (doseq [[icao stats] (:hour-stats stats)]
-      (let [records (->> stats
-                         (map (fn [[[dow hour] count]] [icao dow hour count]))
-                         sort)]
-        (doseq [record records]
-          (println (string/join "," record)))))))
+  (let [state_ (atom (statevec/initial-state 34.13366 -118.19241))]
+    (statevec/start-server state_)
+    (statevec/process-all state_ {:count 10000000 :fetch-size 1000})))
