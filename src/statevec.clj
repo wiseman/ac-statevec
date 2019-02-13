@@ -148,6 +148,10 @@
     `(defmethod update-state-for-msg ~type ~args ~@body)))
 
 
+(defmsghandler org.opensky.libadsb.msgs.OperationalStatusV0Msg [state msg rec]
+  state)
+
+
 (defmsghandler org.opensky.libadsb.msgs.AirborneOperationalStatusV1Msg [state msg rec]
   state)
 
