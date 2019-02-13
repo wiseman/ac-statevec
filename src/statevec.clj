@@ -155,6 +155,8 @@
 (defmsghandler org.opensky.libadsb.msgs.AirborneOperationalStatusV2Msg [state msg rec]
   state)
 
+(defmsghandler org.opensky.libadsb.msgs.SurfaceOperationalStatusV2Msg [state msg rec]
+  state)
 
 (defmsghandler org.opensky.libadsb.msgs.AllCallReply [state msg rec]
   state)
@@ -329,7 +331,7 @@
                 true)))
 
 
-(def record-flights-interval 10000)
+(def record-flights-interval (* 30 60 1000))
 (def flight-timeout (* 10 60 1000))
 
 
@@ -345,7 +347,7 @@
       state
       ;; Time to check for flights:
       :else
-      (do ;;(log "recording flights")
+      (do (log "Woop %s" latest-ts)
           (-> state
               (assoc ::record-flights-check-ts latest-ts)
               (update
@@ -399,7 +401,9 @@
                    (jdbc/query tx
                                [(jdbc/prepare-statement
                                  (:connection tx)
-                                 (str "select * from pings order by timestamp asc limit " count ";")
+                                 (if count
+                                   (str "select * from pings order by timestamp asc limit " count ";")
+                                   "select * from pings order by timestamp asc;")
                                  {:fetch-size (or (:fetch-size options) 100000)})]
                                {:result-set-fn (fn [result-set]
                                                  (reduce-all-results state_ result-set))}))
@@ -512,4 +516,4 @@
 (defn -main [& args]
   (let [state_ (atom (statevec/initial-state 34.13366 -118.19241))]
     (statevec/start-server state_)
-    (statevec/process-all state_ {:count 10000000 :fetch-size 1000})))
+    (statevec/process-all state_ {:fetch-size 100000})))
