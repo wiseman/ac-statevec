@@ -159,6 +159,9 @@
 (defmsghandler org.opensky.libadsb.msgs.AirborneOperationalStatusV2Msg [state msg rec]
   state)
 
+(defmsghandler org.opensky.libadsb.msgs.SurfaceOperationalStatusV1Msg [state msg rec]
+  state)
+
 (defmsghandler org.opensky.libadsb.msgs.SurfaceOperationalStatusV2Msg [state msg rec]
   state)
 
