@@ -325,7 +325,7 @@
                         (seq (:data row))
                         (org.opensky.libadsb.tools/toHexString ^bytes (:data row))]))
         (cond-> (not (.checkParity msg))
-          (update :num-errors inc)))))
+          (update :num-party-errors safe-inc)))))
 
 
 (defn update-hour [state row]
@@ -335,7 +335,7 @@
                 true)))
 
 
-(def record-flights-interval (* 30 60 1000))
+(def record-flights-interval (* 24 60 60 1000))
 (def flight-timeout (* 10 60 1000))
 
 
@@ -351,7 +351,7 @@
       state
       ;; Time to check for flights:
       :else
-      (do (log "Woop %s" latest-ts)
+      (do (log "Woop %s %s" latest-ts (:num-errors state))
           (-> state
               (assoc ::record-flights-check-ts latest-ts)
               (update
@@ -370,19 +370,25 @@
 
 
 (defn update-state [^ModeSDecoder decoder state row]
+  (when (= (:num-rows state) 0)
+    (log "Got first record"))
   (let [timestamp (.getTime ^java.sql.Timestamp (:timestamp row))
-        ^bytes data (:data row)
-        ^ModeSReply msg (.decode decoder data)]
-    (when (= (:num-rows state) 0)
-      (log "Got first record"))
-    (-> state
-        (update-state-msg row msg)
-        (update-state-timestamps row)
-        (update :num-rows safe-inc)
-        (update-in [:icaos (:icao row)] safe-inc)
-        (cond-> (:is_mlat row)
-          (update :num-mlats safe-inc))
-        record-flights)))
+        ^bytes data (:data row)]
+    (try (let [^ModeSReply msg (.decode decoder data)]
+           (-> state
+               (update-state-msg row msg)
+               (update-state-timestamps row)
+               (update :num-rows safe-inc)
+               (update-in [:icaos (:icao row)] safe-inc)
+               (cond-> (:is_mlat row)
+                 (update :num-mlats safe-inc))
+               record-flights))
+         (catch org.opensky.libadsb.exceptions.BadFormatException e
+           (log "Decoding error for message %s: %s"
+                (org.opensky.libadsb.tools/toHexString data)
+                e)
+           (update state :num-errors safe-inc)))))
+
 
 
 (defn reduce-all-results [state_ rows]
@@ -407,7 +413,7 @@
                                  (:connection tx)
                                  (if count
                                    (str "select * from pings order by timestamp asc limit " count ";")
-                                   "select * from pings order by timestamp asc;")
+                                   "select * from pings where timestamp > '2017-12-29 14:32:00' order by timestamp asc;")
                                  {:fetch-size (or (:fetch-size options) 100000)})]
                                {:result-set-fn (fn [result-set]
                                                  (reduce-all-results state_ result-set))}))
