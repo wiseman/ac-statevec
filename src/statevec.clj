@@ -406,7 +406,7 @@
 
 (defn process-all
   ([state_]
-   (process-all state_ {:count 1000000}))
+   (process-all state_ {}))
   ([state_ options]
    (let [start-time-ms (System/currentTimeMillis)
          count (:count options)
@@ -416,7 +416,7 @@
                                  (:connection tx)
                                  (if count
                                    (str "select * from pings order by timestamp asc limit " count ";")
-                                   "select * from pings where timestamp > '2017-12-29 14:32:00' order by timestamp asc;")
+                                   "select * from pings order by timestamp asc;")
                                  {:fetch-size (or (:fetch-size options) 100000)})]
                                {:result-set-fn (fn [result-set]
                                                  (reduce-all-results state_ result-set))}))
