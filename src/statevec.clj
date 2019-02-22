@@ -435,8 +435,14 @@
                   (if end-time (format "timestamp <= '%s'" end-time))
                   (if icaos (format "icao in (%s)"
                                     (string/join ","
-                                                 (map #(format "'%s'" %) icaos))))])]
-
+                                                 (map #(format "'%s'" %) icaos))))])
+        filter-str (if (seq filters)
+                     (str "where " (string/join " and " filters))
+                     nil)]
+    (cond-> "select * from pings"
+      filter-str (str " " filter-str)
+      true (str " order by timestamp asc")
+      max-num-records (str " limit " max-num-records))))
 
 
 (defn process-all
@@ -444,14 +450,13 @@
    (process-all state_ {}))
   ([state_ options]
    (let [start-time-ms (System/currentTimeMillis)
-         count (:count options)
+         query (build-query options)
+         _ (log "Using query: %s" query)
          results (jdbc/with-db-transaction [tx (gflags/flags :db-spec)]
                    (jdbc/query tx
                                [(jdbc/prepare-statement
                                  (:connection tx)
-                                 (if count
-                                   (str "select * from pings order by timestamp asc limit " count ";")
-                                   "select * from pings order by timestamp asc;")
+                                 query
                                  {:fetch-size (or (:fetch-size options) 100000)})]
                                {:result-set-fn (fn [result-set]
                                                  (reduce-all-results state_ result-set))}))
@@ -574,6 +579,6 @@
                   end-time (assoc :end-time end-time)
                   max-num-records (assoc :max-num-records max-num-records)
                   icaos-str (assoc :icaos (string/split)))]
-  (let [state_ (atom (statevec/initial-state 34.13366 -118.19241))]
-    (statevec/start-server state_)
-    (statevec/process-all state_ options))))
+    (let [state_ (atom (statevec/initial-state 34.13366 -118.19241))]
+      (statevec/start-server state_)
+      (statevec/process-all state_ options))))
