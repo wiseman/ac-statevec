@@ -1,16 +1,18 @@
 (ns statevec
   ""
-  (:require [cheshire.core :as cheshire]
-            [clojure.java.jdbc :as jdbc]
-            [clojure.pprint :as pprint]
-            [clojure.set :as set]
-            [clojure.string :as string]
-            [com.lemonodor.gflags :as gflags]
-            [compojure.route :as route]
-            [compojure.core :as compojure]
-            [java-time :as jt]
-            [org.httpkit.server :as server]
-            [clojure.set :as set])
+  (:require
+   [cheshire.core :as cheshire]
+   [clojure.core.async :as a]
+   [clojure.java.jdbc :as jdbc]
+   [clojure.pprint :as pprint]
+   [clojure.set :as set]
+   [clojure.set :as set]
+   [clojure.string :as string]
+   [com.lemonodor.gflags :as gflags]
+   [compojure.core :as compojure]
+   [compojure.route :as route]
+   [java-time :as jt]
+   [org.httpkit.server :as server])
   (:import [java.time.format DateTimeFormatter]
            [org.opensky.libadsb
             ModeSDecoder
@@ -112,18 +114,18 @@
 
 (def safe-inc (fnil inc 0))
 
-(defn update-svv
+(defn update-state-vector-value
   ([sv tag val ts]
-   (update-svv sv tag val ts {}))
+   (update-state-vector-value sv tag val ts {}))
   ([sv tag val ts options]
    (if (:append? options)
      (update sv tag (fnil conj []) [val ts])
      (assoc sv tag [val ts]))))
 
 
-(defn get-svv
+(defn get-state-vector-value
   ([sv tag]
-   (get-svv sv tag nil))
+   (get-state-vector-value sv tag nil))
   ([sv tag default]
    (if sv
      (let [pair (sv tag)]
@@ -133,7 +135,7 @@
      default)))
 
 
-(defn get-svv-time [sv tag]
+(defn get-state-vector-value-time [sv tag]
   (nth (sv tag) 1))
 
 
@@ -147,16 +149,115 @@
 
 
 (defn state-vec-last-updated [sv]
-  (get-svv-time sv :msg-count))
+  (get-state-vector-value-time sv :msg-count))
 
 
-(defn update-ac-svv
+;; ------------------------------------------------------------------------
+;; Track detectors
+;; ------------------------------------------------------------------------
+
+(defn curviness [bearings]
+  (Math/abs (apply + (map (fn [[^double a ^double b]] (- a b))
+                          (partition 2 1 bearings)))))
+
+
+(defn too-old? [datum ^java.sql.Timestamp now max-age-ms]
+  (let [then ^java.sql.Timestamp (:timestamp datum)
+        time-diff-ms (- (.getTime now) (.getTime then))]
+    (> time-diff-ms max-age-ms)))
+
+
+(defn distance [pos1 pos2]
+  (let [earth-radius 6372.8 ;; km
+        sin2 (fn [theta] (* (Math/sin theta) (Math/sin theta)))
+        alpha (fn [lat1 lat2 delta-lat delta-long]
+                (+ (sin2 (/ delta-lat 2))
+                   (* (sin2 (/ delta-long 2)) (Math/cos lat1) (Math/cos lat2))))
+        {lat1 :lat lon1 :lon} pos1
+        {lat2 :lat lon2 :lon} pos2
+        delta-lat (Math/toRadians (- lat2 lat1))
+        delta-lon (Math/toRadians (- lon2 lon1))
+        lat1 (Math/toRadians lat1)
+        lat2 (Math/toRadians lat2)]
+    (* earth-radius 2
+       (Math/asin (Math/sqrt (alpha lat1 lat2 delta-lat delta-lon))))))
+
+
+(defn bearing [pos1 pos2]
+  (let [{lat1 :lat lon1 :lon} pos1
+        {lat2 :lat lon2 :lon} pos2
+        lat1 ^double (Math/toRadians lat1)
+        lat2 ^double (Math/toRadians lat2)
+        lon-diff ^double (Math/toRadians (- ^double lon2 ^double lon1))
+        y ^double (* (Math/sin lon-diff) (Math/cos lat2))
+        x ^double (- (* (Math/cos lat1) (Math/sin lat2))
+                     (* (Math/sin lat1) (Math/cos lat2) (Math/cos lon-diff)))]
+    (mod (+ (Math/toDegrees (Math/atan2 y x)) 360.0) 360.0)))
+
+
+(defn add-position-bearing-and-distance [hist pos ts]
+  (let [last-pos (last (:positions hist))
+        dist (distance last-pos pos)]
+    (-> hist
+        (update :positions conj (assoc pos :timestamp ts))
+        (update :bearings  conj {:timestamp ts :bearing (bearing last-pos pos)})
+        (update :distances conj {:timestamp ts :distance dist}))))
+
+
+(def window-duration-ms (* 5 60 1000))
+
+
+(defn log-orbits [state]
+  (doseq [[icao hist] state]
+    (let [c (->> hist :bearings (map :bearing) curviness)
+          d (->> hist :distances (map :distance) (apply +))]
+      (when (> c 360.0)
+        (log "AWW %s %s %s %s" (->> hist :bearings first :timestamp) icao d c)))))
+
+
+(defn update-orbit-state [state rec pos]
+  (let [icao (:icao rec)
+        ts (:timestamp rec)
+        hist (get state icao nil)]
+    (if (nil? hist)
+      (assoc state icao {:positions [(assoc pos :timestamp ts)]
+                         :bearings []
+                         :distances []})
+      (let [age-filter (complement #(too-old? % ts window-duration-ms))
+            new-state
+            (assoc state icao (-> hist
+                                  (add-position-bearing-and-distance pos ts)
+                                  (update :positions #(->> % (filter age-filter) (into [])))
+                                  (update :bearings #(->> % (filter age-filter) (into [])))
+                                  (update :distances #(->> % (filter age-filter) (into [])))))]
+        (log-orbits new-state)
+        new-state))))
+
+
+
+(def ac-event-chan (a/chan 1000))
+
+(def orbit-state_ (atom {}))
+
+
+(defn orbit-detector []
+  (reset! orbit-state_ {})
+  (a/go-loop []
+    (let [[rec tag val] (a/<! ac-event-chan)]
+      (when (= tag :pos)
+        (swap! orbit-state_ update-orbit-state rec val))
+      (recur)))
+  ac-event-chan)
+
+
+(defn update-aircraft-state-vector-value
   ([state rec tag val]
-   (update-ac-svv state rec tag val {}))
+   (update-aircraft-state-vector-value state rec tag val {}))
   ([state rec tag val options]
    (assert (:icao rec))
+   (a/>!! ac-event-chan [rec tag val])
    (update-in state [:state-vecs (:icao rec)]
-              update-svv tag val (:timestamp rec) options)))
+              update-state-vector-value tag val (:timestamp rec) options)))
 
 
 ;; ------------------------------------------------------------------------
@@ -193,19 +294,19 @@
 
 
 (defmsghandler org.opensky.libadsb.msgs.TCASResolutionAdvisoryMsg [state msg rec]
-  (update-ac-svv state rec :tcas (str msg) {:append? true}))
+  (update-aircraft-state-vector-value state rec :tcas (str msg) {:append? true}))
 
 
 (defmsghandler org.opensky.libadsb.msgs.AltitudeReply [state msg rec]
-  (update-ac-svv state rec :alt (.getAltitude msg)))
+  (update-aircraft-state-vector-value state rec :alt (.getAltitude msg)))
 
 
 (defmsghandler org.opensky.libadsb.msgs.CommBAltitudeReply [state msg rec]
-  (update-ac-svv state rec :alt (.getAltitude msg)))
+  (update-aircraft-state-vector-value state rec :alt (.getAltitude msg)))
 
 
 (defmsghandler org.opensky.libadsb.msgs.CommBIdentifyReply [state msg rec]
-  (update-ac-svv state rec :squawk (.getIdentity msg)))
+  (update-aircraft-state-vector-value state rec :squawk (.getIdentity msg)))
 
 
 (defmsghandler org.opensky.libadsb.msgs.CommDExtendedLengthMsg [state msg rec]
@@ -217,7 +318,7 @@
 
 
 (defmsghandler org.opensky.libadsb.msgs.IdentifyReply [state msg rec]
-  (update-ac-svv state rec :squawk (.getIdentity msg)))
+  (update-aircraft-state-vector-value state rec :squawk (.getIdentity msg)))
 
 
 ;;(defmsghandler org.opensky.libadsb.msgs.ModeSReply [state msg rec]
@@ -225,14 +326,14 @@
 
 
 (defmsghandler org.opensky.libadsb.msgs.ShortACAS [state msg rec]
-  (update-ac-svv state rec :alt (.getAltitude msg)))
+  (update-aircraft-state-vector-value state rec :alt (.getAltitude msg)))
 
 
 (defmsghandler org.opensky.libadsb.msgs.LongACAS [state msg rec]
   (-> state
-      (update-ac-svv rec :alt (.getAltitude msg))
+      (update-aircraft-state-vector-value rec :alt (.getAltitude msg))
       (cond-> (.hasValidRAC msg)
-        (update-ac-svv
+        (update-aircraft-state-vector-value
          rec :advisory
          {:no-pass-below (.noPassBelow msg)
           :no-pass-above (.noPassAbove msg)
@@ -245,24 +346,24 @@
 
 (defmsghandler org.opensky.libadsb.msgs.VelocityOverGroundMsg [state msg rec]
   (-> state
-      (update-ac-svv rec :vspd (.getVerticalRate msg))
-      (update-ac-svv rec :hdg (.getHeading msg))
-      (update-ac-svv rec :spd (.getVelocity msg))))
+      (update-aircraft-state-vector-value rec :vspd (.getVerticalRate msg))
+      (update-aircraft-state-vector-value rec :hdg (.getHeading msg))
+      (update-aircraft-state-vector-value rec :spd (.getVelocity msg))))
 
 
 (defmsghandler org.opensky.libadsb.msgs.IdentificationMsg [state msg rec]
-  (update-ac-svv
+  (update-aircraft-state-vector-value
    state rec :callsign (String. (.getIdentity msg))))>
 
 
 (defmsghandler org.opensky.libadsb.msgs.AirspeedHeadingMsg [state msg rec]
   (-> state
       (cond-> (.hasAirspeedInfo msg)
-        (update-ac-svv rec :air-spd (.getAirspeed msg)))
+        (update-aircraft-state-vector-value rec :air-spd (.getAirspeed msg)))
       (cond-> (.hasVerticalRateInfo msg)
-        (update-ac-svv rec :vspd (.getVerticalRate msg)))
+        (update-aircraft-state-vector-value rec :vspd (.getVerticalRate msg)))
       (cond-> (.hasHeadingStatusFlag msg)
-        (update-ac-svv rec :hdg (.getHeading msg)))))
+        (update-aircraft-state-vector-value rec :hdg (.getHeading msg)))))
 
 
 (defmsghandler SurfacePositionV0Msg [state msg rec]
@@ -273,7 +374,7 @@
                        ts
                        (:receiver-pos state))]
     (if pos
-      (update-ac-svv
+      (update-aircraft-state-vector-value
        state rec :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)})
       state)))
 
@@ -286,7 +387,7 @@
                        ts
                        (:receiver-pos state))]
     (if pos
-      (update-ac-svv
+      (update-aircraft-state-vector-value
        state rec :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)})
       state)))
 
@@ -331,11 +432,11 @@
     (-> state
         (update-in [:msg-types msg-type] safe-inc)
         (update-in [:msg-classes (class msg)] safe-inc)
-        (update-ac-svv
+        (update-aircraft-state-vector-value
          row
          :msg-count
-         (safe-inc (get-svv (get-in state [:state-vecs (:icao row)]) :msg-count 0)))
-        (update-ac-svv row :rssi (dbfs (:signal_level row)))
+         (safe-inc (get-state-vector-value (get-in state [:state-vecs (:icao row)]) :msg-count 0)))
+        (update-aircraft-state-vector-value row :rssi (dbfs (:signal_level row)))
         (cond-> (not (or (= msg-type "MODES_REPLY")
                          (= msg-type "EXTENDED_SQUITTER")))
           (update-state-for-msg msg row))
@@ -389,7 +490,7 @@
                             (let [^java.sql.Timestamp last-updated (state-vec-last-updated sv)]
                               (if (>= (- (.getTime latest-ts) (.getTime last-updated)) flight-timeout)
                                 (do
-                                  ;;(log "Saving off flight for %s (%s messages) at %s" icao (get-svv sv :msg-count) latest-ts)
+                                  ;;(log "Saving off flight for %s (%s messages) at %s" icao (get-state-vector-value sv :msg-count) latest-ts)
                                   false)
                                 true)))
                           svs)))))))))
@@ -427,6 +528,24 @@
       (reset! state_ (assoc state :processing-complete? true)))))
 
 
+;; Turns this:
+;;
+;; {:start-time "2019-01-01 00:00:00-08"
+;;  :end-time "2019-01-01 23:59:59-08"
+;;  :icaos ["AE0000"]
+;;  :max-num-records 10000}
+;;
+;; Into this:
+;;
+;; select * from pings
+;;   where timestamp > '2019-01-01 00:00:00-08' and
+;;         timestamp < '2019-01-01 23:59:59-08' and
+;;         icaos in ('AE0000')
+;;   order by timestamp asc
+;;   limit 10000
+;;
+;; Janky, but that's OK.
+
 (defn build-query [options]
   (let [{:keys [start-time end-time max-num-records icaos]} options
         filters (filter
@@ -463,7 +582,7 @@
          end-time-ms (System/currentTimeMillis)
          duration-ms (- end-time-ms start-time-ms)
          num-rows (:num-rows results)]
-     (log "Processed %s records in %.1f s: %.1f records/s"
+     (log "Processed %s records in %.1f s (%.1f records/s)"
           (:num-rows results)
           (/ duration-ms 1000.0)
           (/ num-rows (/ duration-ms 1000.0)))
@@ -474,29 +593,29 @@
 
 
 (defmethod state-vec->json :dump1090-mutability [kind sv icao now-secs]
-  (let [pos (get-svv sv :pos)
+  (let [pos (get-state-vector-value sv :pos)
         ^java.sql.Timestamp last-update (state-vec-last-updated sv)
         last-update-secs (if last-update
                            (- now-secs (/ (.getTime last-update) 1000.0))
                            100000)]
     (-> {:hex icao
-         :messages (get-svv sv :msg-count)
+         :messages (get-state-vector-value sv :msg-count)
          :seen last-update-secs
-         :rssi (get-svv sv :rssi)}
+         :rssi (get-state-vector-value sv :rssi)}
         (cond->
             pos (assoc :lat (:lat pos))
             pos (assoc :lon (:lon pos))
             pos (assoc
                  :seen_pos
                  (- now-secs
-                    (/ (.getTime ^java.sql.Timestamp (get-svv-time sv :pos))
+                    (/ (.getTime ^java.sql.Timestamp (get-state-vector-value-time sv :pos))
                        1000.0)))
-            (:squawk sv) (assoc :squawk (get-svv sv :squawk))
-            (:callsign sv) (assoc :flight (get-svv sv :callsign))
-            (:hdg sv) (assoc :track (get-svv sv :hdg))
-            (:vspd sv) (assoc :vert_rate (get-svv sv :vspd))
-            (:spd sv) (assoc :speed (get-svv sv :spd))
-            (:alt sv) (assoc :altitude (get-svv sv :alt))))))
+            (:squawk sv) (assoc :squawk (get-state-vector-value sv :squawk))
+            (:callsign sv) (assoc :flight (get-state-vector-value sv :callsign))
+            (:hdg sv) (assoc :track (get-state-vector-value sv :hdg))
+            (:vspd sv) (assoc :vert_rate (get-state-vector-value sv :vspd))
+            (:spd sv) (assoc :speed (get-state-vector-value sv :spd))
+            (:alt sv) (assoc :altitude (get-state-vector-value sv :alt))))))
 
 
 ;; FlightAware's dump1090 uses almost the same JSON. The main
@@ -578,7 +697,14 @@
                   start-time (assoc :start-time start-time)
                   end-time (assoc :end-time end-time)
                   max-num-records (assoc :max-num-records max-num-records)
-                  icaos-str (assoc :icaos (string/split)))]
+                  icaos-str (assoc :icaos (-> icaos-str string/upper-case (string/split #","))))]
+    (orbit-detector)
     (let [state_ (atom (statevec/initial-state 34.13366 -118.19241))]
       (statevec/start-server state_)
-      (statevec/process-all state_ options))))
+      (statevec/process-all state_ options)
+      (log "Found %s distinct ICAOs" (count (:state-vecs @state_)))))
+  (doseq [[k hist] @orbit-state_]
+    (let [d (->> hist :distances (map :distance) (apply +))
+          c (->> hist :bearings (map :bearing) curviness)]
+      (println k d c (/ c d))))
+  (System/exit 0))
