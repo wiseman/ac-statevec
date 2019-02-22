@@ -5,6 +5,7 @@
             [clojure.pprint :as pprint]
             [clojure.set :as set]
             [clojure.string :as string]
+            [com.lemonodor.gflags :as gflags]
             [compojure.route :as route]
             [compojure.core :as compojure]
             [java-time :as jt]
@@ -29,7 +30,29 @@
 ;; (statevec/process-all state_ {:count 10000000 :fetch-size 1000})
 
 
-(def db-spec "jdbc:postgresql://wiseman@localhost:5432/orbital")
+(gflags/define-string "db-spec"
+  "jdbc:postgresql://wiseman@localhost:5432/orbital"
+  "The JDBC DB spec to use.")
+
+(gflags/define-integer "fetch-size"
+  100000
+  "The DB fetch size to use.")
+
+(gflags/define-integer "max-num-records"
+  nil
+  "The max number of records to process")
+
+(gflags/define-string "start-time"
+  nil
+  "Start time, e.g. '2018-04-14 00:00:00'")
+
+(gflags/define-string "end-time"
+  nil
+  "End time, e.g. '2018-04-14 00:00:00'")
+
+(gflags/define-string "icaos"
+  nil
+  "List of ICAOs, e.g. 'AE0000,FFFFFF'")
 
 
 ;; ------------------------------------------------------------------------
@@ -404,13 +427,25 @@
       (reset! state_ (assoc state :processing-complete? true)))))
 
 
+(defn build-query [options]
+  (let [{:keys [start-time end-time max-num-records icaos]} options
+        filters (filter
+                 identity
+                 [(if start-time (format "timestamp >= '%s'" start-time))
+                  (if end-time (format "timestamp <= '%s'" end-time))
+                  (if icaos (format "icao in (%s)"
+                                    (string/join ","
+                                                 (map #(format "'%s'" %) icaos))))])]
+
+
+
 (defn process-all
   ([state_]
    (process-all state_ {}))
   ([state_ options]
    (let [start-time-ms (System/currentTimeMillis)
          count (:count options)
-         results (jdbc/with-db-transaction [tx db-spec]
+         results (jdbc/with-db-transaction [tx (gflags/flags :db-spec)]
                    (jdbc/query tx
                                [(jdbc/prepare-statement
                                  (:connection tx)
@@ -527,6 +562,18 @@
 
 
 (defn -main [& args]
+  (gflags/parse-flags (into ["argv0"] args))
+  (let [fetch-size (gflags/flags :fetch-size)
+        start-time (gflags/flags :start-time)
+        end-time (gflags/flags :end-time)
+        icaos-str (gflags/flags :icaos)
+        max-num-records (gflags/flags :max-num-records)
+        options (cond-> {}
+                  fetch-size (assoc :fetch-size fetch-size)
+                  start-time (assoc :start-time start-time)
+                  end-time (assoc :end-time end-time)
+                  max-num-records (assoc :max-num-records max-num-records)
+                  icaos-str (assoc :icaos (string/split)))]
   (let [state_ (atom (statevec/initial-state 34.13366 -118.19241))]
     (statevec/start-server state_)
-    (statevec/process-all state_ {:fetch-size 100000})))
+    (statevec/process-all state_ options))))
