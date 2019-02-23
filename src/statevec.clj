@@ -69,7 +69,7 @@
 
 
 (defn dbfs [v]
-  (* 20 (Math/log10 (/ (max v 0.5) 255.0))))
+  (* 20 (Math/log10 ^double (/ (double (max v 0.5)) 255.0))))
 
 
 (defn day-of-week
@@ -156,12 +156,12 @@
 ;; Track detectors
 ;; ------------------------------------------------------------------------
 
-(defn curviness [bearings]
+(defn curviness ^double [bearings]
   (Math/abs
-   (reduce (fn [^double sum [^double a ^double b]]
-             (+ sum (- a b)))
-           0.0
-           (partition 2 1 bearings))))
+   ^double (reduce (fn [^double sum [^double a ^double b]]
+                     (+ sum (- a b)))
+                   0.0
+                   (partition 2 1 bearings))))
 
 
 (defn too-old? [datum ^java.sql.Timestamp now max-age-ms]
@@ -172,14 +172,14 @@
 
 (defn distance [pos1 pos2]
   (let [earth-radius 6372.8 ;; km
-        sin2 (fn [^double theta] (* (Math/sin theta) (Math/sin theta)))
-        alpha (fn [lat1 lat2 ^double delta-lat ^double delta-long]
-                (+ (sin2 (/ delta-lat 2))
-                   (* (sin2 (/ delta-long 2)) (Math/cos lat1) (Math/cos lat2))))
+        sin2 (fn sin2 ^double [^double theta] (* (Math/sin theta) (Math/sin theta)))
+        alpha (fn alpha ^double [^double lat1 ^double lat2 ^double delta-lat ^double delta-lon]
+                (+ (sin2 (/ delta-lat 2.0))
+                   (* (sin2 (/ delta-lon 2)) (Math/cos lat1) (Math/cos lat2))))
         {lat1 :lat lon1 :lon} pos1
         {lat2 :lat lon2 :lon} pos2
-        delta-lat (Math/toRadians (- lat2 lat1))
-        delta-lon (Math/toRadians (- lon2 lon1))
+        delta-lat (Math/toRadians (- ^double lat2 ^double lat1))
+        delta-lon (Math/toRadians (- ^double lon2 ^double lon1))
         lat1 (Math/toRadians lat1)
         lat2 (Math/toRadians lat2)]
     (* earth-radius 2
