@@ -157,8 +157,11 @@
 ;; ------------------------------------------------------------------------
 
 (defn curviness [bearings]
-  (Math/abs (apply + (map (fn [[^double a ^double b]] (- a b))
-                          (partition 2 1 bearings)))))
+  (Math/abs
+   (reduce (fn [^double sum [^double a ^double b]]
+             (+ sum (- a b)))
+           0.0
+           (partition 2 1 bearings))))
 
 
 (defn too-old? [datum ^java.sql.Timestamp now max-age-ms]
@@ -169,8 +172,8 @@
 
 (defn distance [pos1 pos2]
   (let [earth-radius 6372.8 ;; km
-        sin2 (fn [theta] (* (Math/sin theta) (Math/sin theta)))
-        alpha (fn [lat1 lat2 delta-lat delta-long]
+        sin2 (fn [^double theta] (* (Math/sin theta) (Math/sin theta)))
+        alpha (fn [lat1 lat2 ^double delta-lat ^double delta-long]
                 (+ (sin2 (/ delta-lat 2))
                    (* (sin2 (/ delta-long 2)) (Math/cos lat1) (Math/cos lat2))))
         {lat1 :lat lon1 :lon} pos1
@@ -462,7 +465,7 @@
                 true)))
 
 
-(def record-flights-interval (* 24 60 60 1000))
+(def record-flights-interval (* 60 1000))
 (def flight-timeout (* 10 60 1000))
 
 
