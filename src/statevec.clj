@@ -96,6 +96,10 @@
   (BigInteger. bin 2))
 
 
+(defn timestamp->ms [^java.sql.Timestamp ts]
+  (.getTime ts))
+
+
 (defn decode-surface-position
   [^ModeSDecoder decoder
    ^SurfacePositionV0Msg msg
@@ -218,39 +222,21 @@
         (log "AWW %s %s %s %s" (->> hist :bearings first :timestamp) icao d c)))))
 
 
-(defn update-orbit-state [state rec pos]
-  (let [icao (:icao rec)
-        ts (:timestamp rec)
-        hist (get state icao nil)]
-    (if (nil? hist)
-      (assoc state icao {:positions [(assoc pos :timestamp ts)]
-                         :bearings []
-                         :distances []})
-      (let [age-filter (complement #(too-old? % ts window-duration-ms))
-            new-state
-            (assoc state icao (-> hist
-                                  (add-position-bearing-and-distance pos ts)
-                                  (update :positions #(->> % (filter age-filter) (into [])))
-                                  (update :bearings #(->> % (filter age-filter) (into [])))
-                                  (update :distances #(->> % (filter age-filter) (into [])))))]
-        (log-orbits new-state)
-        new-state))))
+(def flight-chan (a/chan 1000))
+
+(def flight-state_ (atom {}))
 
 
-
-(def ac-event-chan (a/chan 1000))
-
-(def orbit-state_ (atom {}))
-
-
-(defn orbit-detector []
-  (reset! orbit-state_ {})
-  (a/go-loop []
-    (let [[rec tag val] (a/<! ac-event-chan)]
-      (when (= tag :pos)
-        (swap! orbit-state_ update-orbit-state rec val))
+(defn flight-recorder []
+  (reset! flight-state_ {})
+  (let [safe-conj (fnil conj [])]
+    (a/go-loop []
+      (let [[icao history] (a/<! flight-chan)]
+        (swap! flight-state_
+               update
+               #(safe-conj % history)))
       (recur)))
-  ac-event-chan)
+  flight-chan)
 
 
 (defn update-aircraft-state-vector-value
@@ -258,7 +244,6 @@
    (update-aircraft-state-vector-value state rec tag val {}))
   ([state rec tag val options]
    (assert (:icao rec))
-   (a/>!! ac-event-chan [rec tag val])
    (update-in state [:state-vecs (:icao rec)]
               update-state-vector-value tag val (:timestamp rec) options)))
 
@@ -369,6 +354,16 @@
         (update-aircraft-state-vector-value rec :hdg (.getHeading msg)))))
 
 
+(defn update-aircraft-pos [state rec ^Position pos]
+  (let [datum {:lat (.getLatitude pos)
+               :lon (.getLongitude pos)
+               :timestamp (:timestamp rec)}
+        icao (:icao rec)]
+    (-> state
+        (update-aircraft-state-vector-value rec :pos datum)
+        (update [:histories icao] (fnil conj []) datum))))
+
+
 (defmsghandler SurfacePositionV0Msg [state msg rec]
   (let [ts (:timestamp rec)
         ^Position pos (decode-surface-position
@@ -390,8 +385,7 @@
                        ts
                        (:receiver-pos state))]
     (if pos
-      (update-aircraft-state-vector-value
-       state rec :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)})
+      (update-aircraft-pos state rec pos)
       state)))
 
 
@@ -416,7 +410,9 @@
    :msg-classes {}
    :earliest-ts nil
    :latest-ts nil
-   :state-vecs {}})
+   :aircraft {}}
+   :state-vecs {}
+   :histories {})
 
 
 (defn update-state-timestamps [state row]
@@ -470,6 +466,32 @@
 
 
 (defn record-flights [state]
+  (let [^java.sql.Timestamp latest-ts (:latest-ts state)]
+    (update
+     state
+     :histories
+     (fn [histories]
+       (into {}
+             (filter
+              (fn [[icao history]]
+                (let [^java.sql.Timestamp first-ts (:timestamp (first history))
+                      ^java.sql.Timestamp last-ts (:timestamp (last history))
+                      duration-secs (/ (- (.getTime last-ts) (.getTime first-ts)) 1000.0)]
+                  (if (>= (- (.getTime latest-ts) (.getTime last-ts)) flight-timeout)
+                    (do
+                      (log "Saving flight for %s: %s-%s (%s messages, %.1f minutes"
+                           icao
+                           first-ts
+                           last-ts
+                           (count history)
+                           (/ duration-secs 60.0))
+                      (a/>!! flight-chan [icao history])
+                      false)
+                    true)))
+              histories))))))
+
+
+(defn maybe-record-flights [state]
   (let [^java.sql.Timestamp latest-ts (:latest-ts state)
         ^java.sql.Timestamp record-flights-check-ts (::record-flights-check-ts state)]
     (cond
@@ -484,19 +506,7 @@
       (do (log "Woop %s %s" latest-ts (:num-errors state))
           (-> state
               (assoc ::record-flights-check-ts latest-ts)
-              (update
-               :state-vecs
-               (fn update-svs [svs]
-                 (into
-                  {}
-                  (filter (fn woo [[icao sv]]
-                            (let [^java.sql.Timestamp last-updated (state-vec-last-updated sv)]
-                              (if (>= (- (.getTime latest-ts) (.getTime last-updated)) flight-timeout)
-                                (do
-                                  ;;(log "Saving off flight for %s (%s messages) at %s" icao (get-state-vector-value sv :msg-count) latest-ts)
-                                  false)
-                                true)))
-                          svs)))))))))
+              record-flights)))))
 
 
 (defn update-state [^ModeSDecoder decoder state row]
@@ -512,7 +522,7 @@
                (update-in [:icaos (:icao row)] safe-inc)
                (cond-> (:is_mlat row)
                  (update :num-mlats safe-inc))
-               record-flights))
+               maybe-record-flights))
          (catch org.opensky.libadsb.exceptions.BadFormatException e
            (log "Decoding error for message %s: %s"
                 (org.opensky.libadsb.tools/toHexString data)
@@ -701,13 +711,9 @@
                   end-time (assoc :end-time end-time)
                   max-num-records (assoc :max-num-records max-num-records)
                   icaos-str (assoc :icaos (-> icaos-str string/upper-case (string/split #","))))]
-    (orbit-detector)
+    (flight-recorder)
     (let [state_ (atom (statevec/initial-state 34.13366 -118.19241))]
       (statevec/start-server state_)
       (statevec/process-all state_ options)
       (log "Found %s distinct ICAOs" (count (:state-vecs @state_)))))
-  (doseq [[k hist] @orbit-state_]
-    (let [d (->> hist :distances (map :distance) (apply +))
-          c (->> hist :bearings (map :bearing) curviness)]
-      (println k d c (/ c d))))
   (System/exit 0))
