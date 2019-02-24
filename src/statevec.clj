@@ -655,10 +655,10 @@
      results)))
 
 
-(defmulti state-vec->json (fn [kind sv icao now-secs] kind))
+(defmulti statevec->json (fn [kind sv icao now-secs] kind))
 
 
-(defmethod state-vec->json :dump1090-mutability [kind sv icao now-secs]
+(defmethod statevec->json :dump1090-mutability [kind sv icao now-secs]
   (let [pos (get-statevec-value sv :pos)
         ^java.sql.Timestamp last-update (statevec-last-updated sv)
         last-update-secs (if last-update
@@ -687,8 +687,8 @@
 ;; differences seem to be (1) some keys have different names and (2)
 ;; mlat- and tis-b- sourced info is called out.
 
-(defmethod state-vec->json :dump1090-fa [kind sv icao now-secs]
-  (let [json (state-vec->json :dump1090-mutability sv icao now-secs)]
+(defmethod statevec->json :dump1090-fa [kind sv icao now-secs]
+  (let [json (statevec->json :dump1090-mutability sv icao now-secs)]
     (set/rename-keys
      json
      {:altitude :alt_baro
@@ -696,10 +696,10 @@
       :vert_rate :baro_rate})))
 
 
-(defn state-vecs->json [kind svs now-secs]
-  (map (fn [[icao sv]]
-         (state-vec->json kind sv icao now-secs))
-       svs))
+(defn aircraft->json [kind aircraft now-secs]
+  (map (fn [[icao info]]
+         (statevec->json kind (:statevec info) icao now-secs))
+       aircraft))
 
 
 (defn state->aircraft-json [kind state]
@@ -709,7 +709,7 @@
                    nil)]
     {:now now-secs
      :messages (:num-rows state)
-     :aircraft (state-vecs->json kind (:state-vecs state) now-secs)}))
+     :aircraft (aircraft->json kind (:aircraft state) now-secs)}))
 
 
 (defn serve-receiver-json [state_]
