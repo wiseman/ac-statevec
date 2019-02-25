@@ -528,6 +528,19 @@
         aircraft)))))
 
 
+(defn remove-stale-aircraft [state]
+  (let [now (:latest-ts state)
+        stale-icaos (reduce-kv (fn [stale icao info]
+                                 (let [last-updated (statevec-last-updated (:statevec info))]
+                                   (if (> (ts-diff now last-updated) (* 15 60 1000))
+                                     (conj stale icao)
+                                     stale)))
+                               []
+                               (:aircraft state))]
+    (assoc state :aircraft
+           (apply dissoc (:aircraft state) stale-icaos))))
+
+
 (defn maybe-record-flights [state]
   (let [^java.sql.Timestamp latest-ts (:latest-ts state)
         ^java.sql.Timestamp record-flights-check-ts (::record-flights-check-ts state)]
@@ -543,23 +556,8 @@
       (do (log "Woop %-23s errors:%-3s aircraft:%-3s" latest-ts (:num-errors state) (count (:aircraft state)))
           (-> state
               (assoc ::record-flights-check-ts latest-ts)
+              remove-stale-aircraft
               record-flights)))))
-
-
-(defn remove-stale-aircraft [state]
-  (let [now (:latest-ts state)]
-    (update
-     state
-     :aircraft
-     (fn [aircraft]
-       (reduce-kv
-        (fn [m icao info]
-          (let [last-updated (statevec-last-updated (:statevec info))]
-            (if (> (ts-diff now last-updated) (* 15 60 1000))
-              m
-              (assoc m icao info))))
-        {}
-        aircraft)))))
 
 
 (defn update-state [^ModeSDecoder decoder state row]
@@ -574,8 +572,7 @@
                ;;(update-in [:icaos (:icao row)] safe-inc)
                (cond-> (:is_mlat row)
                  (update :num-mlats safe-inc))
-               maybe-record-flights
-               remove-stale-aircraft))
+               maybe-record-flights))
          (catch org.opensky.libadsb.exceptions.BadFormatException e
            (log "Decoding error for message %s: %s"
                 (org.opensky.libadsb.tools/toHexString data)
