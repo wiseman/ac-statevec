@@ -291,14 +291,33 @@
     (spit path (json/generate-string (history->geojson history) {:pretty true}))))
 
 
+(def curviness-threshold (* 10 360))
+
+
 (defn flight-recorder []
   (reset! flights_ [])
   (a/go-loop []
-    (let [[icao history] (a/<! flight-chan)]
-      (write-flight-geojson! icao history)
-      (swap! flights_
-             conj
-             [icao history])
+    (let [[icao history] (a/<! flight-chan)
+          c (flight-curviness history)
+          d (flight-distance history)
+          ^java.sql.Timestamp first-ts (:timestamp (first history))
+          ^java.sql.Timestamp last-ts (:timestamp (last history))
+          duration-secs (/ (ts-diff last-ts first-ts) 1000.0)]
+      (when (and (> c curviness-threshold)
+                 (> d 5.0)
+                 (< d 1000.0)
+                 (> (/ c d) 50.0))
+        (log "Saving flight for %s: %s-%s (%s messages, %.1f minutes %s"
+             icao
+             first-ts
+             last-ts
+             (count history)
+             (/ duration-secs 60.0)
+             (flight-info history))
+        (write-flight-geojson! icao history)
+        (swap! flights_
+               conj
+               [icao history]))
       (recur)))
   flight-chan)
 
@@ -526,7 +545,6 @@
 
 (def record-flights-interval (* 5 60 1000))
 (def flight-timeout (* 10 60 1000))
-(def curviness-threshold (* 10 360))
 
 
 (defn record-flights
@@ -551,20 +569,8 @@
                      ^java.sql.Timestamp last-ts (:timestamp (last history))
                      duration-secs (/ (ts-diff last-ts first-ts) 1000.0)]
                  (if (or (get options :final?) (>= (ts-diff latest-ts last-ts) flight-timeout))
-                   (let [c (flight-curviness history)
-                         d (flight-distance history)]
-                     (when (and (> c curviness-threshold)
-                                (> d 5.0)
-                                (< d 1000.0)
-                                (> (/ c d) 50.0))
-                       (log "Saving flight for %s: %s-%s (%s messages, %.1f minutes %s"
-                            icao
-                            first-ts
-                            last-ts
-                            (count history)
-                            (/ duration-secs 60.0)
-                            (flight-info history))
-                       (a/>!! flight-chan [icao history]))
+                   (do
+                     (a/>!! flight-chan [icao history])
                      m)
                    (assoc m icao info))))))
          {}
