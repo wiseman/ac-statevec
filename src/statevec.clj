@@ -1,7 +1,7 @@
 (ns statevec
   ""
   (:require
-   [cheshire.core :as cheshire]
+   [cheshire.core :as json]
    [clojure.core.async :as a]
    [clojure.java.jdbc :as jdbc]
    [clojure.pprint :as pprint]
@@ -171,10 +171,14 @@
 ;; Track detectors
 ;; ------------------------------------------------------------------------
 
+(defn bearing-diff [a b]
+  (- 180.0 (mod (+ (- a b) 180.0) 360.0)))
+
+
 (defn curviness ^double [bearings]
   (Math/abs
    ^double (reduce (fn [^double sum [^double a ^double b]]
-                     (+ sum (- a b)))
+                     (+ sum (bearing-diff a b)))
                    0.0
                    (partition 2 1 bearings))))
 
@@ -241,11 +245,51 @@
 
 (def flights_ (atom []))
 
+(def counter_ (atom 0))
+
+
+(defn history->geojson [history]
+  {"type" "LineString"
+   "coordinates" (map (fn [pos]
+                        [(:lon pos) (:lat pos)])
+                      history)})
+
+
+(defn flight-curviness [flight]
+  (->> (partition 2 1 flight)
+       (map #(apply bearing %))
+       curviness))
+
+
+(defn flight-distance [flight]
+  (->> (partition 2 1 flight)
+       (map #(apply distance %))
+       (apply +)))
+
+
+(defn flight-info [flight]
+  (format
+   "Total distance: %.1f, curviness: %.1f"
+   (float (flight-distance flight))
+   (float (flight-curviness flight))))
+
+
+(defn write-flight-geojson! [icao history]
+  (let [path (format "geojson/%s-%s-%s-%s.geojson"
+                     icao
+                     (jt/format "yyyy-MM-dd'T'HH:mm:ss" (jt/local-date-time (:timestamp (first history))))
+                     (int (flight-curviness history))
+                     @counter_)]
+    (swap! counter_ inc)
+    (log "Writing %s" path)
+    (spit path (json/generate-string (history->geojson history)))))
+
 
 (defn flight-recorder []
   (reset! flights_ [])
   (a/go-loop []
     (let [[icao history] (a/<! flight-chan)]
+      (write-flight-geojson! icao history)
       (swap! flights_
              conj
              [icao history])
@@ -478,54 +522,45 @@
 (def flight-timeout (* 10 60 1000))
 
 
-(defn flight-curviness [flight]
-  (->> (partition 2 1 flight)
-       (map #(apply bearing %))
-       curviness))
-
-
-(defn flight-distance [flight]
-  (->> (partition 2 1 flight)
-       (map #(apply distance %))
-       (apply +)))
-
-
-(defn flight-info [flight]
-  (format
-   "Total distance: %.1f, curviness: %.1f"
-   (float (flight-distance flight))
-   (float (flight-curviness flight))))
-
-
-(defn record-flights [state]
-  (let [^java.sql.Timestamp latest-ts (:latest-ts state)]
-    (update
-     state
-     :aircraft
-     (fn [aircraft]
-       (reduce-kv
-        (fn [m icao info]
-          (let [history (:history info)]
-            (if (empty? history)
-              (assoc m icao info)
-              (let [^java.sql.Timestamp first-ts (:timestamp (first history))
-                    ^java.sql.Timestamp last-ts (:timestamp (last history))
-                    duration-secs (/ (ts-diff last-ts first-ts) 1000.0)]
-                (if (>= (ts-diff latest-ts last-ts) flight-timeout)
-                  (do
-                    (when (> (flight-curviness history) 720)
-                      (log "Saving flight for %s: %s-%s (%s messages, %.1f minutes %s"
-                           icao
-                           first-ts
-                           last-ts
-                           (count history)
-                           (/ duration-secs 60.0)
-                           (flight-info history)))
-                    (a/>!! flight-chan [icao history])
-                    m)
-                  (assoc m icao info))))))
-        {}
-        aircraft)))))
+(defn record-flights
+  ([state]
+   (record-flights state {}))
+  ([state options]
+   ;;(log "recording flights")
+   (let [^java.sql.Timestamp latest-ts (:latest-ts state)]
+     (update
+      state
+      :aircraft
+      (fn [aircraft]
+        (reduce-kv
+         (fn [m icao info]
+           (let [history (:history info)]
+             (if (empty? history)
+               (do
+                 (assoc m icao info)
+                 ;;(log "Empty history")
+                 )
+               (let [^java.sql.Timestamp first-ts (:timestamp (first history))
+                     ^java.sql.Timestamp last-ts (:timestamp (last history))
+                     duration-secs (/ (ts-diff last-ts first-ts) 1000.0)]
+                 (if (or (get options :final?) (>= (ts-diff latest-ts last-ts) flight-timeout))
+                   (do
+                     ;;(log "curviness: %s" (flight-curviness history))
+                     ;;(log "bearings %s" (vec (->> (partition 2 1 history)
+                     ;;                             (map #(apply bearing %)))))
+                     (when (> (flight-curviness history) (* 6 360))
+                       (log "Saving flight for %s: %s-%s (%s messages, %.1f minutes %s"
+                            icao
+                            first-ts
+                            last-ts
+                            (count history)
+                            (/ duration-secs 60.0)
+                            (flight-info history))
+                       (a/>!! flight-chan [icao history]))
+                     m)
+                   (assoc m icao info))))))
+         {}
+         aircraft))))))
 
 
 (defn remove-stale-aircraft [state]
@@ -553,11 +588,29 @@
       state
       ;; Time to check for flights:
       :else
-      (do (log "Woop %-23s errors:%-3s aircraft:%-3s" latest-ts (:num-errors state) (count (:aircraft state)))
-          (-> state
-              (assoc ::record-flights-check-ts latest-ts)
-              remove-stale-aircraft
-              record-flights)))))
+      (-> state
+          (assoc ::record-flights-check-ts latest-ts)
+          remove-stale-aircraft
+          record-flights))))
+
+
+(def print-status-interval (* 24 60 60 1000))
+
+
+(defn maybe-print-status [state]
+  (let [^java.sql.Timestamp latest-ts (:latest-ts state)
+        ^java.sql.Timestamp print-status-ts (::print-status-ts state)]
+    (cond
+      ;; Haven't printed status yet.
+      (nil? print-status-ts)
+      (assoc state ::print-status-ts latest-ts)
+      ;; Have printed status recently:
+      (< (ts-diff latest-ts print-status-ts) print-status-interval)
+      state
+      ;; Time to log status:
+      :else
+      (do (log "Status %-23s errors: %-3s aircraft: %-3s" latest-ts (:num-errors state) (count (:aircraft state)))
+          (assoc state ::print-status-ts latest-ts)))))
 
 
 (defn update-state [^ModeSDecoder decoder state row]
@@ -572,7 +625,8 @@
                ;;(update-in [:icaos (:icao row)] safe-inc)
                (cond-> (:is_mlat row)
                  (update :num-mlats safe-inc))
-               maybe-record-flights))
+               maybe-record-flights
+               maybe-print-status))
          (catch org.opensky.libadsb.exceptions.BadFormatException e
            (log "Decoding error for message %s: %s"
                 (org.opensky.libadsb.tools/toHexString data)
@@ -645,11 +699,12 @@
          end-time-ms (System/currentTimeMillis)
          duration-ms (- end-time-ms start-time-ms)
          num-rows (:num-rows results)]
-     (log "Processed %s records in %.1f s (%.1f records/s)"
-          (:num-rows results)
-          (/ duration-ms 1000.0)
-          (/ num-rows (/ duration-ms 1000.0)))
-     results)))
+     (let [final-state (swap! state_ #(record-flights % {:final? true}))]
+       (log "Processed %s records in %.1f s (%.1f records/s)"
+            (:num-rows final-state)
+            (/ duration-ms 1000.0)
+            (/ num-rows (/ duration-ms 1000.0)))
+       final-state))))
 
 
 (defmulti statevec->json (fn [kind sv icao now-secs] kind))
@@ -714,7 +769,7 @@
    :headers {"Content-Type" "application/json; charset=utf-8"}
    :body (-> @state_
              state->receiver-json
-             cheshire/generate-string)})
+             json/generate-string)})
 
 
 (defn serve-aircraft-json [kind state_]
@@ -723,7 +778,7 @@
      :headers {"Content-Type" "application/json; charset=utf-8"}
      :body (-> @state_
                json-gen
-               cheshire/generate-string)}))
+               json/generate-string)}))
 
 (defonce server_ (atom nil))
 
