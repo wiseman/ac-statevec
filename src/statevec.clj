@@ -267,11 +267,17 @@
        (apply +)))
 
 
+(defn flight-normalized-curviness [flight]
+  (/ (flight-curviness flight)
+     (flight-distance flight)))
+
+
 (defn flight-info [flight]
   (format
-   "Total distance: %.1f, curviness: %.1f"
+   "Total distance: %.1f, curviness: %.1f normalized curviness: %.2f"
    (float (flight-distance flight))
-   (float (flight-curviness flight))))
+   (float (flight-curviness flight))
+   (/ (flight-curviness flight) (flight-distance flight))))
 
 
 (defn write-flight-geojson! [icao history]
@@ -282,7 +288,7 @@
                      @counter_)]
     (swap! counter_ inc)
     (log "Writing %s" path)
-    (spit path (json/generate-string (history->geojson history)))))
+    (spit path (json/generate-string (history->geojson history) {:pretty true}))))
 
 
 (defn flight-recorder []
@@ -520,6 +526,7 @@
 
 (def record-flights-interval (* 5 60 1000))
 (def flight-timeout (* 10 60 1000))
+(def curviness-threshold (* 10 360))
 
 
 (defn record-flights
@@ -544,11 +551,12 @@
                      ^java.sql.Timestamp last-ts (:timestamp (last history))
                      duration-secs (/ (ts-diff last-ts first-ts) 1000.0)]
                  (if (or (get options :final?) (>= (ts-diff latest-ts last-ts) flight-timeout))
-                   (do
-                     ;;(log "curviness: %s" (flight-curviness history))
-                     ;;(log "bearings %s" (vec (->> (partition 2 1 history)
-                     ;;                             (map #(apply bearing %)))))
-                     (when (> (flight-curviness history) (* 6 360))
+                   (let [c (flight-curviness history)
+                         d (flight-distance history)]
+                     (when (and (> c curviness-threshold)
+                                (> d 5.0)
+                                (< d 1000.0)
+                                (> (/ c d) 50.0))
                        (log "Saving flight for %s: %s-%s (%s messages, %.1f minutes %s"
                             icao
                             first-ts
