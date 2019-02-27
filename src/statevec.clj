@@ -18,18 +18,9 @@
             ModeSDecoder
             Position]
            [org.opensky.libadsb.msgs
-            AirbornePositionV0Msg
-            EmergencyOrPriorityStatusMsg
-            ModeSReply
-            SurfacePositionV0Msg
-            TCASResolutionAdvisoryMsg]))
+            ModeSReply]))
 
 (set! *warn-on-reflection* true)
-
-
-;; (def state_ (atom (statevec/initial-state 34.13366 -118.19241)))
-;; (statevec/start-server state_)
-;; (statevec/process-all state_ {:count 10000000 :fetch-size 1000})
 
 
 (gflags/define-string "db-spec"
@@ -112,7 +103,7 @@
 
 (defn decode-surface-position
   [^ModeSDecoder decoder
-   ^SurfacePositionV0Msg msg
+   ^org.opensky.libadsb.msgs.SurfacePositionV0Msg msg
    ts
    ^Position pos]
   (.decodePosition decoder (ts->ms ts) msg pos))
@@ -120,7 +111,7 @@
 
 (defn decode-airborne-position
   [^ModeSDecoder decoder
-   ^AirbornePositionV0Msg msg
+   ^org.opensky.libadsb.msgs.AirbornePositionV0Msg msg
    ts
    ^Position pos]
   (.decodePosition decoder (ts->ms ts) msg pos))
@@ -131,7 +122,8 @@
 (def safe-conj (fnil conj []))
 
 
-;; State vector values have a :value and a :timestamp.
+;; State vector values have a :value and a :timestamp, so we can know
+;; when a value is stale.
 
 (defn update-statevec-value
   ([sv tag val ts]
@@ -154,39 +146,28 @@
   (get-in sv [tag :timestamp]))
 
 
-(defn state->receiver-json [state_]
-  (let [^Position pos (:receiver-pos state_)]
-    {:lat (.getLatitude pos)
-     :lon (.getLongitude pos)
-     :refresh 33
-     :version "1.0"
-     :history 0}))
-
-
 (defn statevec-last-updated [sv]
   (get-statevec-value-time sv :msg-count))
 
 
-;; ------------------------------------------------------------------------
-;; Track detectors
-;; ------------------------------------------------------------------------
-
-(defn bearing-diff [a b]
-  (- 180.0 (mod (+ (- a b) 180.0) 360.0)))
-
-
-(defn curviness ^double [bearings]
-  (Math/abs
-   ^double (reduce (fn [^double sum [^double a ^double b]]
-                     (+ sum (bearing-diff a b)))
-                   0.0
-                   (partition 2 1 bearings))))
+(defn update-aircraft-statevec-value
+  ([state rec tag val]
+   (update-aircraft-statevec-value state rec tag val {}))
+  ([state rec tag val options]
+   (assert (:icao rec))
+   (update-in state
+              [:aircraft (:icao rec) :statevec]
+              update-statevec-value tag val (:timestamp rec) options)))
 
 
-(defn too-old? [datum ^java.sql.Timestamp now max-age-ms]
-  (let [then (:timestamp datum)
-        time-diff-ms (ts-diff now then)]
-    (> time-diff-ms max-age-ms)))
+(defn update-aircraft-pos [state rec ^Position pos]
+  (let [datum {:lat (.getLatitude pos)
+               :lon (.getLongitude pos)
+               :timestamp (:timestamp rec)}
+        icao (:icao rec)]
+    (-> state
+        (update-aircraft-statevec-value rec :pos datum)
+        (update-in [:aircraft icao :history] safe-conj datum))))
 
 
 (defn distance
@@ -221,39 +202,30 @@
     (mod (+ (Math/toDegrees (Math/atan2 y x)) 360.0) 360.0)))
 
 
-(defn add-position-bearing-and-distance [hist pos ts]
-  (let [last-pos (last (:positions hist))
-        dist (distance last-pos pos)]
-    (-> hist
-        (update :positions conj (assoc pos :timestamp ts))
-        (update :bearings  conj {:timestamp ts :bearing (bearing last-pos pos)})
-        (update :distances conj {:timestamp ts :distance dist}))))
+(defn bearing-diff
+  "Computes difference between two bearings. Result is [-180, 180]."
+  [a b]
+  (- 180.0 (mod (+ (- a b) 180.0) 360.0)))
 
 
-;; (def window-duration-ms (* 5 60 1000))
+;; ------------------------------------------------------------------------
+;; Circle detector.
+;; ------------------------------------------------------------------------
 
-
-;; (defn log-orbits [state]
-;;   (doseq [[icao hist] state]
-;;     (let [c (->> hist :bearings (map :bearing) curviness)
-;;           d (->> hist :distances (map :distance) (apply +))]
-;;       (when (> c 360.0)
-;;         (log "AWW %s %s %s %s" (->> hist :bearings first :timestamp) icao d c)))))
+(defn curviness
+  "Computes the total curvature of a sequence of bearings."
+  ^double [bearings]
+  (Math/abs
+   ^double (reduce (fn [^double sum [^double a ^double b]]
+                     (+ sum (bearing-diff a b)))
+                   0.0
+                   (partition 2 1 bearings))))
 
 
 (def flight-chan (a/chan 1000))
 
-(def flights_ (atom []))
 
-(def counter_ (atom 0))
-
-
-(defn history->geojson [history]
-  {"type" "LineString"
-   "coordinates" (map (fn [pos]
-                        [(:lon pos) (:lat pos)])
-                      history)})
-
+;; flight is a vector of {:lat <lat> :lon <lon}.
 
 (defn flight-curviness [flight]
   (->> (partition 2 1 flight)
@@ -280,28 +252,47 @@
    (/ (flight-curviness flight) (flight-distance flight))))
 
 
-(defn write-flight-geojson! [icao history]
+(defn history->geojson [history]
+  {"type" "LineString"
+   "coordinates" (map (fn [pos]
+                        [(:lon pos) (:lat pos)])
+                      history)})
+
+
+(def geojson-counter_ (atom 0))
+
+(defn write-flight-geojson!
+  "Writes a geojson file for a flight for visualizing via geojson.io etc."
+  [icao history]
   (let [path (format "geojson/%s-%s-%s-%s.geojson"
                      icao
-                     (jt/format "yyyy-MM-dd'T'HH:mm:ss" (jt/local-date-time (:timestamp (first history))))
+                     (jt/format "yyyy-MM-dd'T'HH:mm:ss"
+                                (-> (first history)
+                                    :timestamp
+                                    jt/local-date-time))
                      (int (flight-curviness history))
-                     @counter_)]
-    (swap! counter_ inc)
+                     @geojson-counter_)]
+    (swap! geojson-counter_ inc)
     (log "Writing %s" path)
-    (spit path (json/generate-string (history->geojson history) {:pretty true}))))
+    (spit
+     path
+     (json/generate-string (history->geojson history) {:pretty true}))))
 
 
 (def curviness-threshold (* 10 360))
 
 
+;; This async loop consumes flights via the flight-chan channel.
+;; Flights that meet our heuristics for circling aircraft are then
+;; written out as geojson.
+
 (defn flight-recorder []
-  (reset! flights_ [])
   (a/go-loop []
     (let [[icao history] (a/<! flight-chan)
           c (flight-curviness history)
           d (flight-distance history)
-          ^java.sql.Timestamp first-ts (:timestamp (first history))
-          ^java.sql.Timestamp last-ts (:timestamp (last history))
+          first-ts (:timestamp (first history))
+          last-ts (:timestamp (last history))
           duration-secs (/ (ts-diff last-ts first-ts) 1000.0)]
       (when (and (> c curviness-threshold)
                  (> d 5.0)
@@ -314,32 +305,9 @@
              (count history)
              (/ duration-secs 60.0)
              (flight-info history))
-        (write-flight-geojson! icao history)
-        (swap! flights_
-               conj
-               [icao history]))
+        (write-flight-geojson! icao history))
       (recur)))
   flight-chan)
-
-
-(defn update-aircraft-statevec-value
-  ([state rec tag val]
-   (update-aircraft-statevec-value state rec tag val {}))
-  ([state rec tag val options]
-   (assert (:icao rec))
-   (update-in state
-              [:aircraft (:icao rec) :statevec]
-              update-statevec-value tag val (:timestamp rec) options)))
-
-
-(defn update-aircraft-pos [state rec ^Position pos]
-  (let [datum {:lat (.getLatitude pos)
-               :lon (.getLongitude pos)
-               :timestamp (:timestamp rec)}
-        icao (:icao rec)]
-    (-> state
-        (update-aircraft-statevec-value rec :pos datum)
-        (update-in [:aircraft icao :history] safe-conj datum))))
 
 
 ;; ------------------------------------------------------------------------
@@ -354,62 +322,63 @@
     `(defmethod update-state-for-msg ~type ~args ~@body)))
 
 
-(defmsghandler org.opensky.libadsb.msgs.OperationalStatusV0Msg [state msg rec]
-  state)
-
-
 (defmsghandler org.opensky.libadsb.msgs.AirborneOperationalStatusV1Msg [state msg rec]
   state)
-
 
 (defmsghandler org.opensky.libadsb.msgs.AirborneOperationalStatusV2Msg [state msg rec]
   state)
 
-(defmsghandler org.opensky.libadsb.msgs.SurfaceOperationalStatusV1Msg [state msg rec]
-  state)
+(defmsghandler org.opensky.libadsb.msgs.AirbornePositionV0Msg [state msg rec]
+  (let [pos (decode-airborne-position (:decoder state)
+                                      msg
+                                      (:timestamp rec)
+                                      (:receiver-pos state))]
+    (if pos
+      (update-aircraft-pos state rec pos)
+      state)))
 
-(defmsghandler org.opensky.libadsb.msgs.SurfaceOperationalStatusV2Msg [state msg rec]
-  state)
+(defmsghandler org.opensky.libadsb.msgs.AirspeedHeadingMsg [state msg rec]
+  (-> state
+      (cond-> (.hasAirspeedInfo msg)
+        (update-aircraft-statevec-value rec :air-spd (.getAirspeed msg)))
+      (cond-> (.hasVerticalRateInfo msg)
+        (update-aircraft-statevec-value rec :vspd (.getVerticalRate msg)))
+      (cond-> (.hasHeadingStatusFlag msg)
+        (update-aircraft-statevec-value rec :hdg (.getHeading msg)))))
 
 (defmsghandler org.opensky.libadsb.msgs.AllCallReply [state msg rec]
   state)
 
-
-(defmsghandler org.opensky.libadsb.msgs.TCASResolutionAdvisoryMsg [state msg rec]
-  (update-aircraft-statevec-value state rec :tcas (str msg) {:append? true}))
-
-
 (defmsghandler org.opensky.libadsb.msgs.AltitudeReply [state msg rec]
   (update-aircraft-statevec-value state rec :alt (.getAltitude msg)))
-
 
 (defmsghandler org.opensky.libadsb.msgs.CommBAltitudeReply [state msg rec]
   (update-aircraft-statevec-value state rec :alt (.getAltitude msg)))
 
-
 (defmsghandler org.opensky.libadsb.msgs.CommBIdentifyReply [state msg rec]
   (update-aircraft-statevec-value state rec :squawk (.getIdentity msg)))
-
 
 (defmsghandler org.opensky.libadsb.msgs.CommDExtendedLengthMsg [state msg rec]
   state)
 
+(defmsghandler org.opensky.libadsb.msgs.EmergencyOrPriorityStatusMsg [state msg rec]
+  (-> state
+      (update-in
+       [:emergency-types (.getEmergencyStateText msg)]
+       safe-inc)
+      (update-in
+       [:emergency-icaos (:icao rec)]
+       safe-inc)))
 
 ;;(defmsghandler org.opensky.libadsb.msgs.ExtendedSquitter [state msg rec]
 ;;  state)
 
+(defmsghandler org.opensky.libadsb.msgs.IdentificationMsg [state msg rec]
+  (update-aircraft-statevec-value
+   state rec :callsign (String. (.getIdentity msg))))>
 
 (defmsghandler org.opensky.libadsb.msgs.IdentifyReply [state msg rec]
   (update-aircraft-statevec-value state rec :squawk (.getIdentity msg)))
-
-
-;;(defmsghandler org.opensky.libadsb.msgs.ModeSReply [state msg rec]
-;;  state)
-
-
-(defmsghandler org.opensky.libadsb.msgs.ShortACAS [state msg rec]
-  (update-aircraft-statevec-value state rec :alt (.getAltitude msg)))
-
 
 (defmsghandler org.opensky.libadsb.msgs.LongACAS [state msg rec]
   (-> state
@@ -425,30 +394,19 @@
           :terminated? (.hasTerminated msg)}
          {:append? true}))))
 
+;;(defmsghandler org.opensky.libadsb.msgs.ModeSReply [state msg rec]
+;;  state)
 
-(defmsghandler org.opensky.libadsb.msgs.VelocityOverGroundMsg [state msg rec]
-  (-> state
-      (update-aircraft-statevec-value rec :vspd (.getVerticalRate msg))
-      (update-aircraft-statevec-value rec :hdg (.getHeading msg))
-      (update-aircraft-statevec-value rec :spd (.getVelocity msg))))
+(defmsghandler org.opensky.libadsb.msgs.OperationalStatusV0Msg [state msg rec]
+  state)
 
+(defmsghandler org.opensky.libadsb.msgs.SurfaceOperationalStatusV1Msg [state msg rec]
+  state)
 
-(defmsghandler org.opensky.libadsb.msgs.IdentificationMsg [state msg rec]
-  (update-aircraft-statevec-value
-   state rec :callsign (String. (.getIdentity msg))))>
+(defmsghandler org.opensky.libadsb.msgs.SurfaceOperationalStatusV2Msg [state msg rec]
+  state)
 
-
-(defmsghandler org.opensky.libadsb.msgs.AirspeedHeadingMsg [state msg rec]
-  (-> state
-      (cond-> (.hasAirspeedInfo msg)
-        (update-aircraft-statevec-value rec :air-spd (.getAirspeed msg)))
-      (cond-> (.hasVerticalRateInfo msg)
-        (update-aircraft-statevec-value rec :vspd (.getVerticalRate msg)))
-      (cond-> (.hasHeadingStatusFlag msg)
-        (update-aircraft-statevec-value rec :hdg (.getHeading msg)))))
-
-
-(defmsghandler SurfacePositionV0Msg [state msg rec]
+(defmsghandler org.opensky.libadsb.msgs.SurfacePositionV0Msg [state msg rec]
   (let [ts (:timestamp rec)
         ^Position pos (decode-surface-position
                        (:decoder state)
@@ -460,28 +418,23 @@
        state rec :pos {:lat (.getLatitude pos) :lon (.getLongitude pos)})
       state)))
 
+(defmsghandler org.opensky.libadsb.msgs.TCASResolutionAdvisoryMsg [state msg rec]
+  (update-aircraft-statevec-value state rec :tcas (str msg) {:append? true}))
 
-(defmsghandler AirbornePositionV0Msg [state msg rec]
-  (let [ts (:timestamp rec)
-        ^Position pos (decode-airborne-position
-                       (:decoder state)
-                       msg
-                       ts
-                       (:receiver-pos state))]
-    (if pos
-      (update-aircraft-pos state rec pos)
-      state)))
+(defmsghandler org.opensky.libadsb.msgs.ShortACAS [state msg rec]
+  (update-aircraft-statevec-value state rec :alt (.getAltitude msg)))
 
-
-(defmsghandler EmergencyOrPriorityStatusMsg [state msg rec]
+(defmsghandler org.opensky.libadsb.msgs.VelocityOverGroundMsg [state msg rec]
   (-> state
-      (update-in
-       [:emergency-types (.getEmergencyStateText msg)]
-       safe-inc)
-      (update-in
-       [:emergency-icaos (:icao rec)]
-       safe-inc)))
+      (update-aircraft-statevec-value rec :vspd (.getVerticalRate msg))
+      (update-aircraft-statevec-value rec :hdg (.getHeading msg))
+      (update-aircraft-statevec-value rec :spd (.getVelocity msg))))
 
+
+
+;; ------------------------------------------------------------------------
+;; Main state & record processing.
+;; ------------------------------------------------------------------------
 
 (defn initial-state [lat lon]
   {:num-rows 0
@@ -543,15 +496,19 @@
                 true)))
 
 
-(def record-flights-interval (* 5 60 1000))
 (def flight-timeout (* 10 60 1000))
 
 
 (defn record-flights
+  "If we haven't gotten a message from an aircraft for 10 minutes,
+  consider its flight to be complete and send it to flight-chan.
+
+  If :final? is true in the options map, then consider all flights to
+  be complete.
+  "
   ([state]
    (record-flights state {}))
   ([state options]
-   ;;(log "recording flights")
    (let [^java.sql.Timestamp latest-ts (:latest-ts state)]
      (update
       state
@@ -563,7 +520,6 @@
              (if (empty? history)
                (do
                  (assoc m icao info)
-                 ;;(log "Empty history")
                  )
                (let [^java.sql.Timestamp first-ts (:timestamp (first history))
                      ^java.sql.Timestamp last-ts (:timestamp (last history))
@@ -577,22 +533,29 @@
          aircraft))))))
 
 
-(defn remove-stale-aircraft [state]
+(defn remove-stale-aircraft
+  "Removes aircraft that haven't sent a message in 15 minutes or more."
+  [state]
   (let [now (:latest-ts state)
-        stale-icaos (reduce-kv (fn [stale icao info]
-                                 (let [last-updated (statevec-last-updated (:statevec info))]
-                                   (if (> (ts-diff now last-updated) (* 15 60 1000))
-                                     (conj stale icao)
-                                     stale)))
-                               []
-                               (:aircraft state))]
+        stales (reduce-kv
+                (fn [stale icao info]
+                  (let [last-updated (statevec-last-updated (:statevec info))]
+                    (if (> (ts-diff now last-updated) (* 15 60 1000))
+                      (conj stale icao)
+                      stale)))
+                []
+                (:aircraft state))]
     (assoc state :aircraft
-           (apply dissoc (:aircraft state) stale-icaos))))
+           (apply dissoc (:aircraft state) stales))))
 
 
-(defn maybe-record-flights [state]
-  (let [^java.sql.Timestamp latest-ts (:latest-ts state)
-        ^java.sql.Timestamp record-flights-check-ts (::record-flights-check-ts state)]
+(def record-flights-interval (* 5 60 1000))
+
+(defn maybe-record-flights
+  "Every 5 minutes, check for completed flights."
+  [state]
+  (let [latest-ts (:latest-ts state)
+        record-flights-check-ts (::record-flights-check-ts state)]
     (cond
       ;; Haven't checked for flights yet;
       (nil? record-flights-check-ts)
@@ -611,9 +574,11 @@
 (def print-status-interval (* 24 60 60 1000))
 
 
-(defn maybe-print-status [state]
-  (let [^java.sql.Timestamp latest-ts (:latest-ts state)
-        ^java.sql.Timestamp print-status-ts (::print-status-ts state)]
+(defn maybe-print-status
+  "Print a status every 24 hours."
+  [state]
+  (let [latest-ts (:latest-ts state)
+        print-status-ts (::print-status-ts state)]
     (cond
       ;; Haven't printed status yet.
       (nil? print-status-ts)
@@ -623,9 +588,12 @@
       state
       ;; Time to log status:
       :else
-      (do (log "Status %-23s errors: %-3s aircraft: %-3s" latest-ts (:num-errors state) (count (:aircraft state)))
+      (do (log "Status %-23s errors: %-3s aircraft: %-3s"
+               latest-ts (:num-errors state) (count (:aircraft state)))
           (assoc state ::print-status-ts latest-ts)))))
 
+
+;; Update state based on a single database record.
 
 (defn update-state [^ModeSDecoder decoder state row]
   (when (= (:num-rows state) 0)
@@ -636,7 +604,6 @@
                (update-state-msg row msg)
                (update-state-timestamps row)
                (update :num-rows safe-inc)
-               ;;(update-in [:icaos (:icao row)] safe-inc)
                (cond-> (:is_mlat row)
                  (update :num-mlats safe-inc))
                maybe-record-flights
@@ -648,6 +615,9 @@
            (update state :num-errors safe-inc)))))
 
 
+
+;; Runs a reduce over the database result set sequence (which is a
+;; lazy stream).
 
 (defn reduce-all-results [state_ rows]
   (let [got-first?_ (atom false)
@@ -721,10 +691,28 @@
        final-state))))
 
 
-(defmulti statevec->json (fn [kind sv icao now-secs] kind))
+;; ------------------------------------------------------------------------
+;; Web interface.
+;; ------------------------------------------------------------------------
+
+;; Returns a dump1090-style receiver.json.
+
+(defn state->receiver-json [state_]
+  (let [^Position pos (:receiver-pos state_)]
+    {:lat (.getLatitude pos)
+     :lon (.getLongitude pos)
+     :refresh 33
+     :version "1.0"
+     :history 0}))
 
 
-(defmethod statevec->json :dump1090-mutability [kind sv icao now-secs]
+;; Returns a dump1090-mutability or dump1090-flightaware
+;; aircraft.json.
+
+(defmulti statevec->aircraft-json (fn [kind sv icao now-secs] kind))
+
+
+(defmethod statevec->aircraft-json :dump1090-mutability [kind sv icao now-secs]
   (let [pos (get-statevec-value sv :pos)
         ^java.sql.Timestamp last-update (statevec-last-updated sv)
         last-update-secs (if last-update
@@ -749,12 +737,13 @@
             (:alt sv) (assoc :altitude (get-statevec-value sv :alt))))))
 
 
-;; FlightAware's dump1090 uses almost the same JSON. The main
-;; differences seem to be (1) some keys have different names and (2)
-;; mlat- and tis-b- sourced info is called out.
+;; FlightAware's dump1090 uses almost the same JSON as mutability's
+;; dump1090. The main differences seem to be (1) some keys have
+;; different names and (2) mlat- and tis-b- sourced info is called
+;; out.
 
-(defmethod statevec->json :dump1090-fa [kind sv icao now-secs]
-  (let [json (statevec->json :dump1090-mutability sv icao now-secs)]
+(defmethod statevec->aircraft-json :dump1090-fa [kind sv icao now-secs]
+  (let [json (statevec->aircraft-json :dump1090-mutability sv icao now-secs)]
     (set/rename-keys
      json
      {:altitude :alt_baro
@@ -764,7 +753,7 @@
 
 (defn aircraft->json [kind aircraft now-secs]
   (map (fn [[icao info]]
-         (statevec->json kind (:statevec info) icao now-secs))
+         (statevec->aircraft-json kind (:statevec info) icao now-secs))
        aircraft))
 
 
@@ -796,6 +785,9 @@
 
 (defonce server_ (atom nil))
 
+
+;; We serve dump1090-mutability at /1/gmap.html and
+;; dump1090-flightaware at /2/index.html.
 
 (defn start-server [state_]
   (when @server_
