@@ -464,12 +464,12 @@
 (defn update-state-msg [state row ^ModeSReply msg]
   (let [msg-type (.name (.getType msg))]
     (-> state
-        ;;(update-in [:msg-types msg-type] safe-inc)
-        ;;(update-in [:msg-classes (class msg)] safe-inc)
+        (update-in [:msg-types msg-type] safe-inc)
+        (update-in [:msg-classes (class msg)] safe-inc)
         (update-aircraft-statevec-value
          row
          :msg-count
-         (safe-inc (get-statevec-value (get-in state [:state-vecs (:icao row)]) :msg-count 0)))
+         (safe-inc (get-statevec-value (get-in state [:aircraft (:icao row) :statevec]) :msg-count 0)))
         (update-aircraft-statevec-value row :rssi (dbfs (:signal_level row)))
         (cond-> (not (or (= msg-type "MODES_REPLY")
                          (= msg-type "EXTENDED_SQUITTER")))
