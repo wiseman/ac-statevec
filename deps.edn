@@ -8,7 +8,7 @@
   org.clojure/core.async {:mvn/version "0.4.490"}
   org.clojure/java.jdbc {:mvn/version "0.7.8"}
   ;;org.opensky-network/libadsb {:local/root "/Users/wiseman/Dropbox/src/java-adsb/target/libadsb-3.0.0.jar"}
-  org.opensky-network/libadsb {:mvn/version "3.0.0"}
+  org.opensky-network/libadsb {:mvn/version "3.1.0"}
   org.postgresql/postgresql {:mvn/version "42.2.5"}}
  :aliases {:test
            {:extra-paths ["test"]
