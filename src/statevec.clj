@@ -6,7 +6,6 @@
    [clojure.java.jdbc :as jdbc]
    [clojure.pprint :as pprint]
    [clojure.set :as set]
-   [clojure.set :as set]
    [clojure.string :as string]
    [com.lemonodor.gflags :as gflags]
    [compojure.core :as compojure]
@@ -188,24 +187,39 @@
        (Math/asin (Math/sqrt (alpha lat1 lat2 delta-lat delta-lon))))))
 
 
+(defn position= [p1 p2]
+  (= p1 p2))
+
+
 (defn bearing
   "Returns the bearing from one position to another, in degrees."
   [pos1 pos2]
-  (let [{lat1 :lat lon1 :lon} pos1
-        {lat2 :lat lon2 :lon} pos2
-        lat1 ^double (Math/toRadians lat1)
-        lat2 ^double (Math/toRadians lat2)
-        lon-diff ^double (Math/toRadians (- ^double lon2 ^double lon1))
-        y ^double (* (Math/sin lon-diff) (Math/cos lat2))
-        x ^double (- (* (Math/cos lat1) (Math/sin lat2))
-                     (* (Math/sin lat1) (Math/cos lat2) (Math/cos lon-diff)))]
-    (mod (+ (Math/toDegrees (Math/atan2 y x)) 360.0) 360.0)))
+  (if (position= pos1 pos2)
+    nil
+    (let [{lat1 :lat lon1 :lon} pos1
+          {lat2 :lat lon2 :lon} pos2
+          lat1 ^double (Math/toRadians lat1)
+          lat2 ^double (Math/toRadians lat2)
+          lon-diff ^double (Math/toRadians (- ^double lon2 ^double lon1))
+          y ^double (* (Math/sin lon-diff) (Math/cos lat2))
+          x ^double (- (* (Math/cos lat1) (Math/sin lat2))
+                       (* (Math/sin lat1) (Math/cos lat2) (Math/cos lon-diff)))]
+      (mod (+ (Math/toDegrees (Math/atan2 y x)) 360.0) 360.0))))
 
 
 (defn bearing-diff
   "Computes difference between two bearings. Result is [-180, 180]."
-  [a b]
-  (- 180.0 (mod (+ (- a b) 180.0) 360.0)))
+  ^double [a b]
+  (let [d (- 180.0 (mod (+ (- a b) 180.0) 360.0))]
+    d))
+
+
+(defn spurious-bearing [bearing]
+  (nil? bearing))
+
+
+(defn spurious-bearing-diff [^double bearing]
+  (> (Math/abs bearing) 90))
 
 
 ;; ------------------------------------------------------------------------
@@ -217,7 +231,10 @@
   ^double [bearings]
   (Math/abs
    ^double (reduce (fn [^double sum [^double a ^double b]]
-                     (+ sum (bearing-diff a b)))
+                     (let [d (bearing-diff a b)]
+                       (if (spurious-bearing-diff d)
+                         sum
+                         (+ sum d))))
                    0.0
                    (partition 2 1 bearings))))
 
@@ -230,6 +247,7 @@
 (defn flight-curviness [flight]
   (->> (partition 2 1 flight)
        (map #(apply bearing %))
+       (filter #(not (spurious-bearing %)))
        curviness))
 
 
@@ -252,11 +270,18 @@
    (/ (flight-curviness flight) (flight-distance flight))))
 
 
-(defn history->geojson [history]
+(defn history->geojson [history properties]
   {"type" "LineString"
    "coordinates" (map (fn [pos]
                         [(:lon pos) (:lat pos)])
-                      history)})
+                      history)
+   "properties" properties})
+
+(defn geojson->flight [path]
+  (map (fn [[lon lat]]
+         {:lat lat :lon lon})
+       (get (json/parse-string (slurp path))
+            "coordinates")))
 
 
 (def geojson-counter_ (atom 0))
@@ -264,19 +289,30 @@
 (defn write-flight-geojson!
   "Writes a geojson file for a flight for visualizing via geojson.io etc."
   [icao history]
-  (let [path (format "geojson/%s-%s-%s-%s.geojson"
+  (let [start-time (-> (first history)
+                       :timestamp
+                       jt/local-date-time)
+        end-time (-> (last history)
+                     :timestamp
+                     jt/local-date-time)
+        path (format "geojson/%s-%s-%s-%s.geojson"
                      icao
-                     (jt/format "yyyy-MM-dd'T'HH:mm:ss"
-                                (-> (first history)
-                                    :timestamp
-                                    jt/local-date-time))
+                     (jt/format "yyyy-MM-dd'T'HH:mm:ss" start-time)
                      (int (flight-curviness history))
                      @geojson-counter_)]
     (swap! geojson-counter_ inc)
     (log "Writing %s" path)
     (spit
      path
-     (json/generate-string (history->geojson history) {:pretty true}))))
+     (json/generate-string
+      (history->geojson history
+                        {"icao" icao
+                         "startTime" (jt/format "yyyy-MM-dd'T'HH:mm:ss" start-time)
+                         "endTime" (jt/format "yyyy-MM-dd'T'HH:mm:ss" end-time)
+                         "curviness" (flight-curviness history)
+                         "distance" (flight-distance history)
+                         "normalizedCurviness" (flight-normalized-curviness history)})
+      {:pretty true}))))
 
 
 (def curviness-threshold (* 10 360))
@@ -439,7 +475,7 @@
 (defn initial-state [lat lon]
   {:num-rows 0
    :decoder (ModeSDecoder.)
-   :receiver-pos (Position. lon lat 0.0)
+   :receiver-pos (Position. (double lon) (double lat) 0.0)
    :num-errors 0
    :num-position-reports 0
    :num-mlats 0
@@ -588,8 +624,11 @@
       state
       ;; Time to log status:
       :else
-      (do (log "Status %-23s errors: %-3s aircraft: %-3s"
-               latest-ts (:num-errors state) (count (:aircraft state)))
+      (do (log "Status %-23s position reports: %-5s errors: %-3s aircraft: %-3s"
+               latest-ts
+               (:num-position-reports state)
+               (:num-errors state)
+               (count (:aircraft state)))
           (assoc state ::print-status-ts latest-ts)))))
 
 
